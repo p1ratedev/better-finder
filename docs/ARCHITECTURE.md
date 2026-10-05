@@ -128,3 +128,4 @@ When the prompt is open, the text field gets the keys. `Enter` accepts and `Esca
 - `getattrlistbulk` for directory reads.
 - Accessibility (`NSAccessibility` for the list view).
 - Fuzzy jump to a directory (zoxide style).
+- Key bindings for non-Latin keyboard layouts (translate the key code with `UCKeyTranslate` and an ASCII-capable layout).

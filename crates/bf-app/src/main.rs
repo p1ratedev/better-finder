@@ -6,6 +6,7 @@
 
 mod app;
 mod debug;
+mod file_ops;
 mod help;
 mod icons;
 mod list_view;
@@ -40,7 +41,10 @@ Usage:
 
 Developer options:
   --debug-screenshot <png>           Save the window as a PNG after the first load, then quit
-  --debug-keys \"<t1> <t2> ...\"       Feed key triggers (keymap syntax) before the screenshot
+  --debug-keys \"<t1> <t2> ...\"       Feed key triggers (keymap syntax) before the screenshot.
+                                     @<ms> waits, @load waits for a load. Prefixes:
+                                     ~ key repeat, ! keymap also with the prompt open,
+                                     ^ same turn as the previous key (no wait for a load)
 
 Environment:
   BETTER_FINDER_TRACE=1              Print timings to stderr

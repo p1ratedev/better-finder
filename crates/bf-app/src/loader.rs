@@ -15,9 +15,18 @@ use bf_core::{Entry, LoadRequest};
 use dispatch2::DispatchQueue;
 
 use crate::app;
+use crate::file_ops;
 
-/// A finished load: the request, the result, and the read time.
-pub type Delivery = (LoadRequest, io::Result<Vec<Entry>>, Duration);
+/// A finished load.
+pub struct Delivery {
+    pub request: LoadRequest,
+    pub result: io::Result<Vec<Entry>>,
+    /// The time to read and sort.
+    pub read_time: Duration,
+    /// The directory is on a local volume. Only then the app asks for
+    /// path-specific icons and the title bar proxy icon.
+    pub is_local: bool,
+}
 
 /// Reads `request.path` on a new thread. The thread sorts the entries with
 /// `sort`, so that `Pane::finish_load` on the main thread sorts a list that
@@ -27,10 +36,7 @@ pub fn spawn(request: LoadRequest, sort: SortOptions) {
 }
 
 fn deliver_on_main(delivery: Delivery) {
-    DispatchQueue::main().exec_async(move || {
-        let (request, result, elapsed) = delivery;
-        app::finish_load(request, result, elapsed);
-    });
+    DispatchQueue::main().exec_async(move || app::finish_load(delivery));
 }
 
 fn run_thread(
@@ -50,7 +56,14 @@ fn run_thread(
             if let Ok(entries) = &mut result {
                 sort_entries(entries, sort);
             }
-            let delivery = (thread_request, result, started.elapsed());
+            let read_time = started.elapsed();
+            let is_local = result.is_ok() && file_ops::is_local_volume(&thread_request.path);
+            let delivery = Delivery {
+                request: thread_request,
+                result,
+                read_time,
+                is_local,
+            };
             let deliver = thread_deliver
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -66,7 +79,12 @@ fn run_thread(
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         if let Some(deliver) = deliver {
-            deliver((request, result, Duration::ZERO));
+            deliver(Delivery {
+                request,
+                result,
+                read_time: Duration::ZERO,
+                is_local: false,
+            });
         }
     }
 }

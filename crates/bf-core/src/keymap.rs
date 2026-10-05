@@ -235,10 +235,21 @@ impl fmt::Display for KeyPress {
             alt,
             shift,
         } = self.mods;
+        // An uppercase letter with another modifier shows as `shift` and the
+        // lowercase letter: `cmd+shift+g`, not `cmd+G`. A bare uppercase
+        // letter stays `G`.
+        let shifted_letter = match self.key {
+            Key::Char(c) if (cmd || ctrl || alt) && c.is_uppercase() => lowercase_of(c),
+            _ => None,
+        };
+        let shift = shift || shifted_letter.is_some();
         for (on, name) in [(cmd, "cmd"), (ctrl, "ctrl"), (alt, "alt"), (shift, "shift")] {
             if on {
                 write!(f, "{name}+")?;
             }
+        }
+        if let Some(lower) = shifted_letter {
+            return write!(f, "{lower}");
         }
         match self.key {
             Key::Named(key) => f.write_str(&named_key_text(key)),
@@ -249,6 +260,17 @@ impl fmt::Display for KeyPress {
             },
         }
     }
+}
+
+/// The lowercase form of the uppercase letter `c`, when it is one character
+/// and its uppercase form is `c` again (so that the text round-trips).
+fn lowercase_of(c: char) -> Option<char> {
+    let mut lower = c.to_lowercase();
+    let (Some(l), None) = (lower.next(), lower.next()) else {
+        return None;
+    };
+    let mut upper = l.to_uppercase();
+    (upper.next() == Some(c) && upper.next().is_none()).then_some(l)
 }
 
 /// A sequence of one or more key presses.
@@ -647,7 +669,15 @@ mod tests {
         assert_eq!(press("G").key, Key::Char('G'));
         assert_eq!(press("cmd+shift+g"), press("cmd+G"));
         assert_eq!(press("G").to_string(), "G");
-        assert_eq!(press("cmd+shift+g").to_string(), "cmd+G");
+        assert_eq!(press("shift+g").to_string(), "G");
+        assert_eq!(press("cmd+shift+g").to_string(), "cmd+shift+g");
+        assert_eq!(press("cmd+G").to_string(), "cmd+shift+g");
+        assert_eq!(press("ctrl+alt+X").to_string(), "ctrl+alt+shift+x");
+        assert_eq!(press("cmd+g").to_string(), "cmd+g");
+        for text in ["cmd+shift+g", "ctrl+alt+shift+x", "G", "cmd+g", "alt+É"] {
+            let p = press(text);
+            assert_eq!(p.to_string().parse::<KeyPress>().unwrap(), p, "{text}");
+        }
         // Other keys keep shift.
         assert!(press("shift+slash").mods.shift);
         assert!(press("shift+up").mods.shift);

@@ -237,6 +237,8 @@ impl ListView {
         let visible = self.visibleRect();
         let drawn = app::with_ref(|s| draw_list(s, bounds, visible, dirty)).flatten();
         let Some(rows) = drawn else { return };
+        // The draw put paths in the icon queue. Get their icons after the frame.
+        icons::schedule_resolve();
         trace!("draw: {rows} rows in {} µs", started.elapsed().as_micros());
         if !FIRST_FRAME.with(|f| f.replace(true)) {
             trace!(
@@ -250,7 +252,8 @@ impl ListView {
 /// Converts a key-down `NSEvent` and sends it to the keymap. True when the
 /// key had a use (an action, a pending sequence, or the end of a sequence).
 pub fn handle_ns_key(event: &NSEvent) -> bool {
-    key_event_from(event).is_some_and(app::handle_key)
+    let repeat = event.isARepeat();
+    key_event_from(event).is_some_and(|key| app::handle_key(key, repeat))
 }
 
 /// Builds a `KeyEvent` from a key-down `NSEvent`.
@@ -361,27 +364,41 @@ fn draw_list(s: &AppState, bounds: NSRect, visible: NSRect, dirty: NSRect) -> Op
     let first = (dirty.origin.y / h).floor().max(0.0) as usize;
     let end = (((dirty.origin.y + dirty.size.height) / h).ceil().max(0.0) as usize).min(len);
     let width = bounds.size.width;
-    let columns = st.visible_columns(width);
-    let now = SystemTime::now();
+    let frame = RowFrame {
+        st,
+        width,
+        columns: st.visible_columns(width),
+        now: SystemTime::now(),
+        path_icons: s.cwd_is_local(),
+    };
     let cursor = s.pane.cursor();
     for row in first..end {
         let Some(entry) = s.pane.visible_entry(row) else {
             break;
         };
-        draw_row(st, entry, row, row == cursor, width, columns, now);
+        draw_row(&frame, entry, row, row == cursor);
     }
     Some(end.saturating_sub(first))
 }
 
-fn draw_row(
-    st: &Style,
-    entry: &Entry,
-    row: usize,
-    selected: bool,
+/// The values that are the same for all rows of one draw.
+struct RowFrame<'a> {
+    st: &'a Style,
     width: f64,
-    columns: &[ColumnSpec],
+    columns: &'a [ColumnSpec],
     now: SystemTime,
-) {
+    /// Ask for path-specific icons (only on a local volume).
+    path_icons: bool,
+}
+
+fn draw_row(frame: &RowFrame<'_>, entry: &Entry, row: usize, selected: bool) {
+    let RowFrame {
+        st,
+        width,
+        columns,
+        now,
+        path_icons,
+    } = *frame;
     let h = st.row_height;
     let y = row as f64 * h;
     if selected {
@@ -393,7 +410,7 @@ fn draw_row(
         NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(rect, 5.0, 5.0).fill();
     }
     if st.show_icons {
-        if let Some(icon) = icons::icon_for(entry) {
+        if let Some(icon) = icons::icon_for(entry, path_icons) {
             let size = st.icon_size;
             let rect = NSRect::new(
                 NSPoint::new(LEFT_PAD, y + ((h - size) / 2.0).round()),

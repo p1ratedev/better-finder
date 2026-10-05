@@ -130,8 +130,8 @@ fn cursor_screen_rect() -> Option<NSRect> {
 
 /// The icon of the entry under the cursor, for the zoom animation.
 fn transition_image() -> Option<Retained<AnyObject>> {
-    let entry = app::with_ref(|s| s.pane.current().cloned()).flatten()?;
-    let icon = icons::icon_for(&entry)?;
+    let (entry, local) = app::with_ref(|s| (s.pane.current().cloned(), s.cwd_is_local()))?;
+    let icon = icons::icon_for(&entry?, local)?;
     Some(Retained::into_super(Retained::into_super(icon)))
 }
 

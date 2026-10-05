@@ -2,6 +2,7 @@
 //! It serves the filter, "go to folder", rename, and new folder.
 
 use std::cell::OnceCell;
+use std::path::PathBuf;
 
 use objc2::rc::Retained;
 use objc2::runtime::Sel;
@@ -23,11 +24,16 @@ use crate::theme::Style;
 pub enum PromptMode {
     Filter,
     Goto,
-    /// `original` is the name before the rename.
+    /// `source` is the full path of the item, from the time the prompt
+    /// opened. The rename does not depend on the current directory.
     Rename {
-        original: String,
+        source: PathBuf,
     },
-    NewFolder,
+    /// `dir` is the directory of the new folder, from the time the prompt
+    /// opened.
+    NewFolder {
+        dir: PathBuf,
+    },
 }
 
 impl PromptMode {
@@ -36,7 +42,7 @@ impl PromptMode {
             PromptMode::Filter => "/",
             PromptMode::Goto => "Go to:",
             PromptMode::Rename { .. } => "Rename:",
-            PromptMode::NewFolder => "New folder:",
+            PromptMode::NewFolder { .. } => "New folder:",
         }
     }
 }
@@ -238,6 +244,9 @@ impl PromptUi {
         self.label.setStringValue(&NSString::from_str(label));
         self.field.setStringValue(&NSString::from_str(text));
         self.bar.layout_fields();
+        // The Quick Look panel can be the key window. Typed text must go to
+        // this window, so make it the key window first.
+        window.makeKeyWindow();
         window.makeFirstResponder(Some(self.field_responder()));
         if let Some(editor) = self.field.currentEditor() {
             editor.setSelectedRange(NSRange::new(select.0, select.1));

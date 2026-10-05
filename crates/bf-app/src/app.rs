@@ -11,7 +11,7 @@
 //! the AppKit work out of the borrow.
 
 use std::cell::RefCell;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -19,10 +19,11 @@ use std::time::{Duration, Instant};
 
 use bf_core::config::{Diagnostic, ThemeMode, default_config_template};
 use bf_core::fs::{display_path, expand_path, home_dir};
-use bf_core::pane::PaneOptions;
+use bf_core::keymap::{Key, KeyPress, NamedKey};
+use bf_core::pane::{LoadKind, PaneOptions};
 use bf_core::{
-    Action, Config, Entry, EntryKind, KeyEvent, KeyOutcome, KeymapState, LoadRequest, LoadResult,
-    OpenOutcome, Pane,
+    Action, Config, Entry, EntryKind, KeyEvent, KeyOutcome, Keymap, KeymapState, LoadRequest,
+    LoadResult, OpenOutcome, Pane,
 };
 use dispatch2::{DispatchQueue, DispatchTime};
 use objc2::rc::Retained;
@@ -39,10 +40,11 @@ use objc2_foundation::{
 };
 
 use crate::debug::{self, trace};
+use crate::file_ops;
 use crate::help::HelpModel;
 use crate::icons;
 use crate::list_view::ListView;
-use crate::loader;
+use crate::loader::{self, Delivery};
 use crate::prompt::PromptMode;
 use crate::quicklook;
 use crate::status_bar::StatusBar;
@@ -110,6 +112,20 @@ pub struct AppState {
     message_id: u64,
     load_generation: u64,
     load_started: Option<Instant>,
+    /// The kind of the load in progress.
+    load_kind: LoadKind,
+    /// The load in progress is an automatic refresh (from the watcher).
+    load_auto: bool,
+    /// Start one refresh when the load in progress completes.
+    refresh_queued: bool,
+    /// The queued refresh comes from the watcher.
+    refresh_queued_auto: bool,
+    /// The current directory is on a local volume.
+    cwd_is_local: bool,
+    /// When an automatic refresh changed the name under the cursor.
+    list_changed_at: Option<Instant>,
+    /// The number of the most recent "go to" check. `goto_checked` ignores old results.
+    goto_check: u64,
     /// The list content changed (entries, filter, sort, hidden, style).
     content_dirty: bool,
     /// A user action: scroll so that the cursor is visible, also when it
@@ -210,8 +226,13 @@ impl AppDelegate {
     }
 }
 
-/// Adds one item to `menu`. An app action has no key equivalent: the
-/// keymap is the only source of keys for app actions.
+thread_local! {
+    /// The menu items of app actions, for `sync_menu_keys`.
+    static ACTION_ITEMS: RefCell<Vec<(Retained<NSMenuItem>, Action)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Adds one item to `menu`.
 fn add_item(
     mtm: MainThreadMarker,
     menu: &NSMenu,
@@ -260,7 +281,7 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &AppDelegate
         None,
     );
     app_menu.addItem(&NSMenuItem::separatorItem(mtm));
-    add_item(
+    let settings = add_item(
         mtm,
         &app_menu,
         "Settings\u{2026}",
@@ -268,7 +289,7 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &AppDelegate
         "",
         Some(target),
     );
-    add_item(
+    let reload = add_item(
         mtm,
         &app_menu,
         "Reload Config",
@@ -297,7 +318,7 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &AppDelegate
         None,
     );
     app_menu.addItem(&NSMenuItem::separatorItem(mtm));
-    add_item(
+    let quit = add_item(
         mtm,
         &app_menu,
         "Quit Better Finder",
@@ -305,6 +326,13 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &AppDelegate
         "",
         None,
     );
+    ACTION_ITEMS.with(|items| {
+        *items.borrow_mut() = vec![
+            (settings, Action::OpenConfig),
+            (reload, Action::ReloadConfig),
+            (quit, Action::Quit),
+        ];
+    });
 
     // The prompt text field needs the standard edit commands and keys.
     let edit = submenu(mtm, &main, "Edit");
@@ -329,6 +357,67 @@ fn build_menu(mtm: MainThreadMarker, app: &NSApplication, delegate: &AppDelegate
 
     app.setMainMenu(Some(&main));
     app.setWindowsMenu(Some(&window_menu));
+}
+
+/// Sets the key equivalents of the app action menu items from the keymap,
+/// like Ghostty: the first binding of the action that is one key press with
+/// `cmd`. No such binding gives no key equivalent. The menu then shows the
+/// real keys, and the keys work while the prompt or Quick Look has focus.
+/// The list view still gets a bound key first: the window precedes the menu.
+fn sync_menu_keys(keymap: &Keymap) {
+    let bindings = keymap.bindings();
+    ACTION_ITEMS.with(|items| {
+        for (item, action) in items.borrow().iter() {
+            let key = bindings
+                .iter()
+                .filter(|(trigger, a)| a == action && trigger.0.len() == 1)
+                .filter_map(|(trigger, _)| menu_key(trigger.0[0]))
+                .next();
+            let (key, mask) = key.unwrap_or((String::new(), NSEventModifierFlags::empty()));
+            trace!("menu: {action} = {key:?} {mask:?}");
+            item.setKeyEquivalent(&NSString::from_str(&key));
+            item.setKeyEquivalentModifierMask(mask);
+        }
+    });
+}
+
+/// The menu key equivalent of a key press with `cmd`. An uppercase letter
+/// implies shift in AppKit, so it needs no shift flag.
+fn menu_key(press: KeyPress) -> Option<(String, NSEventModifierFlags)> {
+    if !press.mods.cmd {
+        return None;
+    }
+    let mut mask = NSEventModifierFlags::Command;
+    if press.mods.ctrl {
+        mask |= NSEventModifierFlags::Control;
+    }
+    if press.mods.alt {
+        mask |= NSEventModifierFlags::Option;
+    }
+    if press.mods.shift {
+        mask |= NSEventModifierFlags::Shift;
+    }
+    let key = match press.key {
+        Key::Char(c) => c,
+        Key::Named(named) => char::from_u32(match named {
+            NamedKey::Enter => 0x0d,
+            NamedKey::Escape => 0x1b,
+            NamedKey::Space => 0x20,
+            NamedKey::Tab => 0x09,
+            NamedKey::Backspace => 0x08,
+            NamedKey::Delete => 0xF728,
+            NamedKey::Up => 0xF700,
+            NamedKey::Down => 0xF701,
+            NamedKey::Left => 0xF702,
+            NamedKey::Right => 0xF703,
+            NamedKey::Home => 0xF729,
+            NamedKey::End => 0xF72B,
+            NamedKey::PageUp => 0xF72C,
+            NamedKey::PageDown => 0xF72D,
+            NamedKey::F(n) => 0xF703 + u32::from(n),
+        })?,
+    };
+    Some((key.to_string(), mask))
 }
 
 // ---- Start ----
@@ -385,6 +474,13 @@ pub fn run(options: RunOptions) -> ExitCode {
         message_id: 0,
         load_generation: generation,
         load_started: Some(load_started),
+        load_kind: LoadKind::Navigate,
+        load_auto: false,
+        refresh_queued: false,
+        refresh_queued_auto: false,
+        cwd_is_local: false,
+        list_changed_at: None,
+        goto_check: 0,
         content_dirty: true,
         reveal_cursor: true,
         rendered: Rendered::default(),
@@ -407,11 +503,14 @@ pub fn run(options: RunOptions) -> ExitCode {
     debug::init(options.screenshot, options.keys);
     // AppKit setup takes much longer than the read of a normal directory.
     // When the result is there, apply it and draw before the run loop starts.
-    if let Some((request, result, read_time)) = first_load.try_take() {
-        finish_load(request, result, read_time);
+    if let Some(delivery) = first_load.try_take() {
+        finish_load(delivery);
     }
     // The first frame does not need the menu.
     build_menu(mtm, &app, &delegate);
+    if let Some(keymap) = with_ref(|s| s.config.keymap.clone()) {
+        sync_menu_keys(&keymap);
+    }
 
     app.run();
     ExitCode::SUCCESS
@@ -493,18 +592,41 @@ fn config_problem(diagnostics: &[Diagnostic], warnings: &[String]) -> Option<Str
 
 // ---- Keys and actions ----
 
+/// True for the actions that a held key (key repeat) can do: cursor moves.
+fn repeat_allowed(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::CursorUp
+            | Action::CursorDown
+            | Action::CursorTop
+            | Action::CursorBottom
+            | Action::PageUp
+            | Action::PageDown
+            | Action::HalfPageUp
+            | Action::HalfPageDown
+    )
+}
+
 /// Sends one key event to the keymap. True when the key had a use.
-pub fn handle_key(event: KeyEvent) -> bool {
+/// `repeat` is true for the automatic repeats of a held key: they do only
+/// cursor moves, so a held key never trashes or opens many items.
+/// While the prompt is open, the keymap gets no keys (false).
+pub fn handle_key(event: KeyEvent, repeat: bool) -> bool {
     let fed = with(|s| {
+        if s.prompt.is_some() {
+            return None;
+        }
         let had_pending = !s.keys.pending().is_empty();
-        (s.keys.feed(&s.config.keymap, &event), had_pending)
+        Some((s.keys.feed(&s.config.keymap, &event), had_pending))
     });
-    let Some((outcome, had_pending)) = fed else {
+    let Some(Some((outcome, had_pending))) = fed else {
         return false;
     };
     match outcome {
         KeyOutcome::Action(action) => {
-            dispatch(action);
+            if !repeat || repeat_allowed(&action) {
+                dispatch(action);
+            }
             true
         }
         KeyOutcome::Pending => {
@@ -664,6 +786,8 @@ impl AppState {
     fn start_load(&mut self, request: LoadRequest) {
         let generation = request.generation;
         self.load_generation = generation;
+        self.load_kind = request.kind;
+        self.load_auto = false;
         self.load_started = Some(Instant::now());
         loader::spawn(request, self.pane.sort());
         after(Duration::from_millis(100), move || {
@@ -671,15 +795,51 @@ impl AppState {
         });
     }
 
+    /// True when the current directory is on a local volume.
+    pub fn cwd_is_local(&self) -> bool {
+        self.cwd_is_local
+    }
+
+    /// True while the pane loads another directory. A refresh does not count.
+    fn navigating(&self) -> bool {
+        self.pane.is_loading() && self.load_kind != LoadKind::Refresh
+    }
+
+    /// Refuses a file operation while the pane loads another directory: the
+    /// entry under the cursor can belong to the directory that goes away.
+    fn refuse_while_navigating(&mut self) -> bool {
+        if self.navigating() {
+            self.set_error("Wait until the folder loads");
+        }
+        self.navigating()
+    }
+
+    /// Reads the directory again after a change. When a load is in
+    /// progress, it queues one refresh for after that load.
+    fn refresh_after_change(&mut self) {
+        if self.pane.is_loading() {
+            self.refresh_queued = true;
+        } else {
+            let request = self.pane.refresh();
+            self.start_load(request);
+        }
+    }
+
     fn open_prompt(
         &mut self,
         mode: PromptMode,
         text: String,
         select: (usize, usize),
+        ql_visible: bool,
         fx: &mut Vec<Effect>,
     ) {
         let label = mode.label();
         self.prompt = Some(mode);
+        // The Quick Look panel sends keys to the keymap. Close it, so that
+        // the typed text goes only to the prompt.
+        if ql_visible {
+            fx.push(Effect::QuickLookClose);
+        }
         if self.help.take().is_some() {
             fx.push(Effect::Help);
         }
@@ -745,7 +905,7 @@ impl AppState {
                 self.start_load(request);
             }
             Action::GotoPrompt => {
-                self.open_prompt(PromptMode::Goto, String::new(), (0, 0), &mut fx)
+                self.open_prompt(PromptMode::Goto, String::new(), (0, 0), ql_visible, &mut fx)
             }
             Action::QuickLook => {
                 if ql_visible || self.pane.current().is_some() {
@@ -759,7 +919,7 @@ impl AppState {
             Action::Filter => {
                 let text = self.pane.filter().to_string();
                 let select = (0, utf16_len(&text));
-                self.open_prompt(PromptMode::Filter, text, select, &mut fx);
+                self.open_prompt(PromptMode::Filter, text, select, ql_visible, &mut fx);
             }
             Action::Cancel => {
                 if ql_visible {
@@ -797,19 +957,30 @@ impl AppState {
                 fx.push(Effect::Help);
             }
             Action::Rename => {
+                if self.refuse_while_navigating() {
+                    return fx;
+                }
                 if let Some(entry) = self.pane.current() {
                     let name = entry.name.clone();
                     let select = (0, stem_utf16_len(entry));
+                    // Keep the full path: the rename must not depend on
+                    // the directory at the time of Enter.
                     let mode = PromptMode::Rename {
-                        original: name.clone(),
+                        source: entry.path.clone(),
                     };
-                    self.open_prompt(mode, name, select, &mut fx);
+                    self.open_prompt(mode, name, select, ql_visible, &mut fx);
                 }
             }
             Action::NewFolder => {
+                if self.refuse_while_navigating() {
+                    return fx;
+                }
                 let text = "untitled folder".to_string();
                 let select = (0, utf16_len(&text));
-                self.open_prompt(PromptMode::NewFolder, text, select, &mut fx);
+                let mode = PromptMode::NewFolder {
+                    dir: self.pane.cwd().to_path_buf(),
+                };
+                self.open_prompt(mode, text, select, ql_visible, &mut fx);
             }
             Action::Trash => self.trash(),
             Action::CopyPath => {
@@ -853,6 +1024,19 @@ impl AppState {
     }
 
     fn trash(&mut self) {
+        if self.refuse_while_navigating() {
+            return;
+        }
+        // An automatic refresh can put another name under the cursor just
+        // before the key press. Ask for a second press.
+        if self
+            .list_changed_at
+            .take()
+            .is_some_and(|t| t.elapsed() < Duration::from_millis(500))
+        {
+            self.set_error("The list changed. Press again to move the item to the Trash.");
+            return;
+        }
         let Some(entry) = self.pane.current() else {
             return;
         };
@@ -865,8 +1049,7 @@ impl AppState {
         match manager.trashItemAtURL_resultingItemURL_error(&url, None) {
             Ok(()) => {
                 self.set_info(format!("Moved \"{name}\" to Trash"));
-                let request = self.pane.refresh();
-                self.start_load(request);
+                self.refresh_after_change();
             }
             Err(err) => {
                 let reason = err.localizedDescription();
@@ -877,20 +1060,15 @@ impl AppState {
 
     fn open_config(&mut self, fx: &mut Vec<Effect>) {
         let path = Config::default_path();
-        if !path.exists() {
-            let created = path
-                .parent()
-                .map_or(Ok(()), std::fs::create_dir_all)
-                .and_then(|()| std::fs::write(&path, default_config_template()));
-            match created {
-                Ok(()) => {
-                    self.set_info(format!("Created {}", display_path(&path)));
-                    fx.push(Effect::WatchConfig);
-                }
-                Err(err) => {
-                    self.set_error(format!("Cannot create {}: {err}", display_path(&path)));
-                    return;
-                }
+        match file_ops::create_new_file(&path, default_config_template().as_bytes()) {
+            Ok(true) => {
+                self.set_info(format!("Created {}", display_path(&path)));
+                fx.push(Effect::WatchConfig);
+            }
+            Ok(false) => {}
+            Err(err) => {
+                self.set_error(format!("Cannot create {}: {err}", display_path(&path)));
+                return;
             }
         }
         let args = [OsString::from("-t"), path.clone().into_os_string()];
@@ -908,7 +1086,6 @@ impl AppState {
         if self.message.as_ref().is_some_and(|m| m.error) {
             self.message = None;
         }
-        let cwd = self.pane.cwd().to_path_buf();
         match mode {
             PromptMode::Filter => self.close_prompt(&mut fx),
             PromptMode::Goto => {
@@ -917,56 +1094,67 @@ impl AppState {
                     self.close_prompt(&mut fx);
                     return fx;
                 }
-                let path = expand_path(input, &cwd);
-                match std::fs::metadata(&path) {
-                    Ok(meta) if meta.is_dir() => {
-                        self.close_prompt(&mut fx);
-                        let request = self.pane.navigate_to(path);
-                        self.start_load(request);
-                    }
-                    Ok(_) => {
-                        let parent = path.parent().map(Path::to_path_buf);
-                        let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
-                        if let (Some(parent), Some(name)) = (parent, name) {
-                            self.close_prompt(&mut fx);
-                            self.pending_select = Some((parent.clone(), name));
-                            let request = self.pane.navigate_to(parent);
-                            self.start_load(request);
-                        }
-                    }
-                    Err(_) => self.set_error("No such folder"),
+                // A `stat` can wait for a long time on a network volume.
+                // Do it on a thread; `goto_checked` continues.
+                let path = expand_path(input, self.pane.cwd());
+                self.goto_check += 1;
+                let id = self.goto_check;
+                let spawned = std::thread::Builder::new()
+                    .name("bf-goto".into())
+                    .spawn(move || {
+                        let is_dir = std::fs::metadata(&path).map(|m| m.is_dir());
+                        after_now(move || goto_checked(id, path, is_dir));
+                    });
+                if let Err(err) = spawned {
+                    self.set_error(format!("Cannot start a thread: {err}"));
                 }
             }
-            PromptMode::Rename { original } => {
-                if text == original {
+            PromptMode::Rename { source } => {
+                let old = source.file_name().unwrap_or(OsStr::new(""));
+                let old_text = old.to_string_lossy().into_owned();
+                if old == OsStr::new(&text) || old_text == text {
                     self.close_prompt(&mut fx);
                     return fx;
                 }
-                if let Err(problem) = check_new_name(&cwd, &text, Some(&original)) {
+                if let Err(problem) = check_name(&text) {
                     self.set_error(problem);
                     return fx;
                 }
-                match std::fs::rename(cwd.join(&original), cwd.join(&text)) {
+                if self.refuse_while_navigating() {
+                    return fx;
+                }
+                let target = source.with_file_name(&text);
+                match file_ops::rename_no_replace(&source, &target) {
                     Ok(()) => {
                         self.close_prompt(&mut fx);
-                        self.pending_select = Some((cwd, text));
-                        let request = self.pane.refresh();
-                        self.start_load(request);
+                        if let Some(dir) = source.parent() {
+                            self.pending_select = Some((dir.to_path_buf(), text));
+                        }
+                        self.refresh_after_change();
                     }
-                    Err(err) => self.set_error(format!("Cannot rename \"{original}\": {err}")),
+                    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                        self.set_error(format!("\"{text}\" already exists"));
+                    }
+                    Err(err) => self.set_error(format!("Cannot rename \"{old_text}\": {err}")),
                 }
             }
-            PromptMode::NewFolder => {
-                if let Err(problem) = check_new_name(&cwd, &text, None) {
+            PromptMode::NewFolder { dir } => {
+                if let Err(problem) = check_name(&text) {
                     self.set_error(problem);
                     return fx;
                 }
-                match std::fs::create_dir(cwd.join(&text)) {
+                if self.refuse_while_navigating() {
+                    return fx;
+                }
+                // `create_dir` fails when the name exists: it never replaces.
+                match std::fs::create_dir(dir.join(&text)) {
                     Ok(()) => {
                         self.close_prompt(&mut fx);
-                        self.pending_select = Some((cwd, text));
-                        let request = self.pane.refresh();
-                        self.start_load(request);
+                        self.pending_select = Some((dir, text));
+                        self.refresh_after_change();
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                        self.set_error(format!("\"{text}\" already exists"));
                     }
                     Err(err) => self.set_error(format!("Cannot create \"{text}\": {err}")),
                 }
@@ -974,11 +1162,52 @@ impl AppState {
         }
         fx
     }
+
+    /// The result of the "go to" check: a directory opens, a file opens its
+    /// directory with the cursor on the file.
+    fn goto_result(&mut self, path: PathBuf, is_dir: io::Result<bool>) -> Vec<Effect> {
+        let mut fx = Vec::new();
+        match is_dir {
+            Ok(true) => {
+                self.close_prompt(&mut fx);
+                let request = self.pane.navigate_to(path);
+                self.start_load(request);
+            }
+            Ok(false) => {
+                let parent = path.parent().map(Path::to_path_buf);
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+                if let (Some(parent), Some(name)) = (parent, name) {
+                    self.close_prompt(&mut fx);
+                    self.pending_select = Some((parent.clone(), name));
+                    let request = self.pane.navigate_to(parent);
+                    self.start_load(request);
+                }
+            }
+            Err(_) => self.set_error("No such folder"),
+        }
+        fx
+    }
 }
 
-/// Checks a name for rename and new folder. `original` is the old name of
-/// a rename: a change of case only is not a conflict.
-fn check_new_name(dir: &Path, name: &str, original: Option<&str>) -> Result<(), String> {
+/// The background check of the "go to" prompt is complete.
+fn goto_checked(id: u64, path: PathBuf, is_dir: io::Result<bool>) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let effects = with(|s| {
+        if s.goto_check != id || s.prompt != Some(PromptMode::Goto) {
+            return Vec::new();
+        }
+        s.goto_result(path, is_dir)
+    })
+    .unwrap_or_default();
+    run_effects(mtm, effects);
+    sync_ui();
+}
+
+/// Checks a name for rename and new folder. The file operation itself
+/// refuses a name that exists.
+fn check_name(name: &str) -> Result<(), String> {
     if name.trim().is_empty() {
         return Err("The name cannot be empty".to_string());
     }
@@ -987,10 +1216,6 @@ fn check_new_name(dir: &Path, name: &str, original: Option<&str>) -> Result<(), 
     }
     if name == "." || name == ".." {
         return Err(format!("The name \"{name}\" is reserved"));
-    }
-    let case_change = original.is_some_and(|o| o.to_lowercase() == name.to_lowercase());
-    if !case_change && std::fs::symlink_metadata(dir.join(name)).is_ok() {
-        return Err(format!("\"{name}\" already exists"));
     }
     Ok(())
 }
@@ -1063,38 +1288,77 @@ fn loading_check(generation: u64) {
 // ---- Directory loads ----
 
 /// The loader calls this on the main queue when a read completes.
-pub fn finish_load(request: LoadRequest, result: io::Result<Vec<Entry>>, read_time: Duration) {
+pub fn finish_load(delivery: Delivery) {
+    let Delivery {
+        request,
+        result,
+        read_time,
+        is_local,
+    } = delivery;
     let started = Instant::now();
     let count = result.as_ref().map(Vec::len).unwrap_or(0);
     let outcome = with(|s| {
         let was_loaded = s.pane.is_loaded();
         let old_cwd = s.pane.cwd().to_path_buf();
+        let old_name = s.pane.current().map(|e| e.name.clone());
         if !s.pane.finish_load(&request, result) {
             return None;
         }
+        let was_auto = std::mem::take(&mut s.load_auto);
         s.loading_visible = false;
         let total = s.load_started.take().map(|t| t.elapsed());
         let failed = s.pane.error().map(str::to_string);
         if let Some(error) = failed.clone() {
             s.pane.clear_error();
             s.set_error(error);
+        } else {
+            s.cwd_is_local = is_local;
         }
         let cwd = s.pane.cwd().to_path_buf();
+        let dir_changed = (!was_loaded && s.pane.is_loaded()) || cwd != old_cwd;
         if let Some((dir, name)) = s.pending_select.take() {
-            if dir == cwd && failed.is_none() {
-                s.pane.select_name(&name);
+            let selected = dir == cwd && failed.is_none() && s.pane.select_name(&name);
+            // A read that started before the change does not have the new
+            // name yet. Keep the selection for the queued refresh.
+            if !selected && s.refresh_queued && dir == cwd {
+                s.pending_select = Some((dir, name));
             }
         }
+        if was_auto && !dir_changed && s.pane.current().map(|e| &e.name) != old_name.as_ref() {
+            s.list_changed_at = Some(Instant::now());
+        }
+        let mut fx = Vec::new();
+        // A rename or a new folder applies to the directory where the
+        // prompt opened. When the directory changed, cancel the prompt.
+        if dir_changed
+            && matches!(
+                s.prompt,
+                Some(PromptMode::Rename { .. } | PromptMode::NewFolder { .. })
+            )
+        {
+            s.close_prompt(&mut fx);
+            s.set_info("The folder changed. The prompt closed.");
+        }
+        if s.refresh_queued && !s.pane.is_loading() {
+            s.refresh_queued = false;
+            let auto = std::mem::take(&mut s.refresh_queued_auto);
+            let request = s.pane.refresh();
+            s.start_load(request);
+            s.load_auto = auto;
+        }
         s.content_dirty = true;
-        let dir_changed = (!was_loaded && s.pane.is_loaded()) || cwd != old_cwd;
-        Some((cwd, dir_changed, total))
+        Some((cwd, dir_changed, total, fx))
     });
-    let Some(Some((cwd, dir_changed, total))) = outcome else {
+    let Some(Some((cwd, dir_changed, total, effects))) = outcome else {
         return;
     };
+    watcher::set_last_read(read_time);
     if dir_changed {
         icons::clear_paths();
         watcher::watch_directory(&cwd);
+    }
+    if let Some(mtm) = MainThreadMarker::new() {
+        run_effects(mtm, effects);
     }
     sync_ui();
     trace!(
@@ -1108,22 +1372,28 @@ pub fn finish_load(request: LoadRequest, result: io::Result<Vec<Entry>>, read_ti
     debug::on_load_finished();
 }
 
-/// The watcher calls this (debounced) when the current directory changes on disk.
+/// The watcher calls this (debounced) when the current directory changes
+/// on disk. A load in progress is not replaced: one refresh waits for it.
 pub fn auto_refresh() {
-    let state = with(|s| {
+    with(|s| {
         if !s.config.auto_refresh || !s.pane.is_loaded() {
-            return false;
+            return;
         }
         if s.pane.is_loading() {
-            // Do not replace a load in progress. Try again later.
-            return true;
+            s.refresh_queued = true;
+            s.refresh_queued_auto = true;
+            return;
         }
         let request = s.pane.refresh();
         s.start_load(request);
-        false
+        s.load_auto = true;
     });
-    if state == Some(true) {
-        after(Duration::from_millis(150), auto_refresh);
+}
+
+/// Redraws the whole list (for example when new icons are available).
+pub fn redraw_list() {
+    if let Some(list) = with_ref(|s| s.ui.list.clone()) {
+        list.setNeedsDisplay(true);
     }
 }
 
@@ -1393,6 +1663,9 @@ fn apply_config(result: LoadResult) {
     });
     let Some(ui) = ui else { return };
     window::apply_look(&ui, &style, titlebar);
+    if let Some(keymap) = with_ref(|s| s.config.keymap.clone()) {
+        sync_menu_keys(&keymap);
+    }
     watch_config_files();
     if let Some(mtm) = MainThreadMarker::new() {
         run_effects(mtm, vec![Effect::Help]);
@@ -1446,7 +1719,8 @@ struct UiPlan {
     metrics: Option<(usize, f64)>,
     redraw: Redraw,
     scroll_to: Option<usize>,
-    title: Option<(String, PathBuf)>,
+    /// The title, the directory, and true when it is on a local volume.
+    title: Option<(String, PathBuf, bool)>,
     quick_look_reload: bool,
 }
 
@@ -1469,7 +1743,7 @@ impl AppState {
             Redraw::None
         };
         let scroll_to = (self.reveal_cursor || dir_changed || cursor_changed).then_some(cursor);
-        let title = dir_changed.then(|| (display_path(&cwd), cwd.clone()));
+        let title = dir_changed.then(|| (display_path(&cwd), cwd.clone(), self.cwd_is_local));
         let quick_look_reload = dir_changed || r.current != current;
         self.content_dirty = false;
         self.reveal_cursor = false;
@@ -1511,10 +1785,15 @@ impl UiPlan {
             self.list.scroll_to_row(row);
         }
         self.status.setNeedsDisplay(true);
-        if let Some((title, path)) = self.title {
+        if let Some((title, path, is_local)) = self.title {
             self.window.setTitle(&NSString::from_str(&title));
-            // The proxy icon costs a few ms. Set it after the frame.
-            after_now(move || set_represented_url(&path));
+            if is_local {
+                // The proxy icon costs a few ms. Set it after the frame.
+                after_now(move || set_represented_url(&path));
+            } else {
+                // The proxy icon reads the disk. Skip it on a network volume.
+                self.window.setRepresentedURL(None);
+            }
         }
         if self.quick_look_reload {
             if let Some(mtm) = MainThreadMarker::new() {

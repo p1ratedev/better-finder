@@ -44,12 +44,30 @@ macro_rules! trace {
 }
 pub(crate) use trace;
 
+/// How a scripted key reaches the app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Feed {
+    /// The normal path: the prompt field when the prompt is open, else the
+    /// keymap.
+    Normal,
+    /// `~key`: the keymap, as an automatic key repeat.
+    Repeat,
+    /// `!key`: the keymap, also when the prompt is open (like a key that
+    /// the Quick Look panel sends to its delegate).
+    Keymap,
+    /// `^key`: the normal path, in the same main-queue turn as the previous
+    /// key. It does not wait for a load in progress.
+    NoWait,
+}
+
 /// One step of a scripted run.
 #[derive(Debug, Clone, Copy)]
 pub enum Step {
-    Key(KeyEvent),
+    Key(KeyEvent, Feed),
     /// `@<ms>`: wait this time before the next step.
     Wait(Duration),
+    /// `@load`: wait until the next directory load completes.
+    WaitLoad,
 }
 
 /// A scripted run: keys to feed, then an optional screenshot.
@@ -58,6 +76,8 @@ struct DebugRun {
     keys: VecDeque<Step>,
     capture_scheduled: bool,
     step_scheduled: bool,
+    /// A `@load` step waits.
+    waiting_for_load: bool,
     done: bool,
 }
 
@@ -66,10 +86,15 @@ thread_local! {
 }
 
 /// Parses `--debug-keys` text: triggers in keymap syntax, separated by spaces.
-/// A trigger with `>` gives one key event for each key press. `@<ms>` waits.
+/// A trigger with `>` gives one key event for each key press. `@<ms>` waits,
+/// `@load` waits for a load. The prefixes `~`, `!`, `^` select a `Feed`.
 pub fn parse_keys(text: &str) -> Result<Vec<Step>, String> {
     let mut steps = Vec::new();
     for token in text.split_whitespace() {
+        if token == "@load" {
+            steps.push(Step::WaitLoad);
+            continue;
+        }
         if let Some(ms) = token.strip_prefix('@').filter(|ms| !ms.is_empty()) {
             let ms: u64 = ms
                 .parse()
@@ -77,14 +102,20 @@ pub fn parse_keys(text: &str) -> Result<Vec<Step>, String> {
             steps.push(Step::Wait(Duration::from_millis(ms)));
             continue;
         }
-        let trigger: Trigger = token
+        let (feed, text) = match token.split_at_checked(1) {
+            Some(("~", rest)) if !rest.is_empty() => (Feed::Repeat, rest),
+            Some(("!", rest)) if !rest.is_empty() => (Feed::Keymap, rest),
+            Some(("^", rest)) if !rest.is_empty() => (Feed::NoWait, rest),
+            _ => (Feed::Normal, token),
+        };
+        let trigger: Trigger = text
             .parse()
             .map_err(|e| format!("--debug-keys: {token}: {e}"))?;
         steps.extend(
             trigger
                 .0
                 .into_iter()
-                .map(|press| Step::Key(key_event(press))),
+                .map(|press| Step::Key(key_event(press), feed)),
         );
     }
     Ok(steps)
@@ -130,6 +161,7 @@ pub fn init(screenshot: Option<PathBuf>, keys: Vec<Step>) {
             keys: keys.into(),
             capture_scheduled: false,
             step_scheduled: false,
+            waiting_for_load: false,
             done: false,
         });
     });
@@ -144,7 +176,38 @@ pub fn init(screenshot: Option<PathBuf>, keys: Vec<Step>) {
 
 /// The app calls this after each finished directory load.
 pub fn on_load_finished() {
+    RUN.with(|run| {
+        if let Ok(mut guard) = run.try_borrow_mut() {
+            if let Some(d) = guard.as_mut() {
+                d.waiting_for_load = false;
+            }
+        }
+    });
     schedule_step();
+}
+
+fn pop_step(only_no_wait: bool) -> Option<Step> {
+    RUN.with(|run| {
+        let mut guard = run.try_borrow_mut().ok()?;
+        let d = guard.as_mut()?;
+        if only_no_wait && !matches!(d.keys.front(), Some(Step::Key(_, Feed::NoWait))) {
+            return None;
+        }
+        d.keys.pop_front()
+    })
+}
+
+fn feed_key(event: KeyEvent, feed: Feed) {
+    trace!("debug-keys: {:?} {:?} {:?}", event.base, event.mods, feed);
+    match (feed, app::prompt_field()) {
+        (Feed::Repeat, _) => {
+            app::handle_key(event, true);
+        }
+        (Feed::Keymap, _) | (Feed::Normal | Feed::NoWait, None) => {
+            app::handle_key(event, false);
+        }
+        (Feed::Normal | Feed::NoWait, Some(field)) => prompt_key(&field, &event),
+    }
 }
 
 /// Runs `step` on the main queue, once. Each key is one main-queue turn,
@@ -176,24 +239,33 @@ fn step() {
             }
         }
     });
-    if app::with_ref(|s| s.pane.is_loading()).unwrap_or(true) {
+    let waiting = RUN.with(|run| {
+        run.try_borrow()
+            .ok()
+            .and_then(|r| r.as_ref().map(|d| d.waiting_for_load))
+            .unwrap_or(false)
+    });
+    if waiting || app::with_ref(|s| s.pane.is_loading()).unwrap_or(true) {
         return;
     }
-    let next = RUN.with(|run| {
-        run.try_borrow_mut()
-            .ok()
-            .and_then(|mut r| r.as_mut().and_then(|d| d.keys.pop_front()))
-    });
-    match next {
-        Some(Step::Key(event)) => {
-            trace!("debug-keys: {:?} {:?}", event.base, event.mods);
-            match app::prompt_field() {
-                Some(field) => prompt_key(&field, &event),
-                None => {
-                    app::handle_key(event);
-                }
+    match pop_step(false) {
+        Some(Step::Key(event, feed)) => {
+            feed_key(event, feed);
+            // `^` keys follow in the same turn, before a load can complete.
+            while let Some(Step::Key(event, feed)) = pop_step(true) {
+                feed_key(event, feed);
             }
             schedule_step();
+            return;
+        }
+        Some(Step::WaitLoad) => {
+            RUN.with(|run| {
+                if let Ok(mut guard) = run.try_borrow_mut() {
+                    if let Some(d) = guard.as_mut() {
+                        d.waiting_for_load = true;
+                    }
+                }
+            });
             return;
         }
         Some(Step::Wait(time)) => {

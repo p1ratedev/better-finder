@@ -14,7 +14,7 @@ path = "src/main.rs"
 bf-core.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 dispatch2 = "0.3"
-notify = "8"
+libc = "0.2"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
