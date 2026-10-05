@@ -1,0 +1,13 @@
+[package]
+name = "bf-core"
+description = "Core logic of Better Finder: config, keymap, file listing, navigation. No UI code."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[dev-dependencies]
+tempfile = "3"
