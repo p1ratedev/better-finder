@@ -12,3 +12,62 @@ path = "src/main.rs"
 
 [dependencies]
 bf-core.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+dispatch2 = "0.3"
+notify = "8"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2-core-foundation",
+    "objc2-uniform-type-identifiers",
+    "NSAppearance",
+    "NSApplication",
+    "NSBezierPath",
+    "NSBitmapImageRep",
+    "NSCell",
+    "NSClipView",
+    "NSColor",
+    "NSControl",
+    "NSEvent",
+    "NSFont",
+    "NSFontDescriptor",
+    "NSGraphics",
+    "NSGraphicsContext",
+    "NSImage",
+    "NSImageRep",
+    "NSLayoutConstraint",
+    "NSMenu",
+    "NSMenuItem",
+    "NSParagraphStyle",
+    "NSPasteboard",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSScrollView",
+    "NSStringDrawing",
+    "NSAttributedString",
+    "NSText",
+    "NSTextField",
+    "NSTextView",
+    "NSView",
+    "NSWindow",
+    "NSWorkspace",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2-core-foundation",
+    "NSArray",
+    "NSAttributedString",
+    "NSData",
+    "NSDictionary",
+    "NSError",
+    "NSFileManager",
+    "NSGeometry",
+    "NSNotification",
+    "NSObject",
+    "NSRange",
+    "NSString",
+    "NSURL",
+    "NSValue",
+] }
+objc2-quick-look-ui = { version = "0.3", default-features = false, features = ["std", "objc2-app-kit", "QLPreviewItem", "QLPreviewPanel"] }
+objc2-uniform-type-identifiers = { version = "0.3", default-features = false, features = ["std", "UTType", "UTCoreTypes"] }
