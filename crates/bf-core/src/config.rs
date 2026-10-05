@@ -221,7 +221,7 @@ pub struct Config {
     /// `directories-first` (default `true`).
     pub sort: SortOptions,
     /// `columns`, a comma-separated list. Default: `size,modified`.
-    /// An empty list shows only names.
+    /// The value `none` shows only names. (An empty value resets to the default.)
     pub columns: Vec<Column>,
     /// `date-format`. Default: `%Y-%m-%d %H:%M`. See `format::format_time`.
     pub date_format: String,

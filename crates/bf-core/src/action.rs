@@ -41,7 +41,7 @@ pub enum Action {
     Filter,
     /// Cancel the most recent mode: key sequence, then Quick Look, then filter.
     Cancel,
-    /// `sort:<key>`. Sets the sort key. Sets the key again to keep the order.
+    /// `sort:<key>`. Sets the sort key. The direction (`reverse`) does not change.
     Sort(SortKey),
     ToggleSortReverse,
     Refresh,

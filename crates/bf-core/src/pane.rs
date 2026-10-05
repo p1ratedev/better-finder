@@ -16,9 +16,11 @@
 //! - Enter a directory, back, forward: the cursor goes to the stored name for
 //!   that directory, or to the first entry.
 //! - Parent: the cursor goes to the directory that you came from.
-//! - Refresh, sort change, hidden toggle, filter change: the cursor stays on
-//!   the same name when it is still visible. If not, the cursor index stays
-//!   the same, clamped to the list.
+//! - Refresh, sort change, hidden toggle: the cursor stays on the same name
+//!   when it is still visible. If not, the cursor index stays the same,
+//!   clamped to the list.
+//! - Filter change: the cursor stays on the same name when it still matches.
+//!   If not, the cursor goes to the first visible entry.
 //! - A directory change clears the filter.
 
 use std::collections::HashMap;
