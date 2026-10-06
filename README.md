@@ -23,6 +23,14 @@ scripts/bundle.sh
 open "dist/Better Finder.app"
 ```
 
+To install the app in `/Applications`, so that Spotlight and Raycast find it:
+
+```sh
+scripts/bundle.sh --install
+```
+
+The app icon is `assets/AppIcon.icns`. To change the icon, edit `scripts/make-icon.swift`, then run `swift scripts/make-icon.swift`.
+
 ## Configuration
 
 The config file is `~/.config/better-finder/config`. If `XDG_CONFIG_HOME` is set, the file is `$XDG_CONFIG_HOME/better-finder/config`. Press `cmd+,` to open the file. The app creates it from a template when it does not exist. Press `cmd+shift+,` to reload it.

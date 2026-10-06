@@ -1,7 +1,18 @@
 #!/usr/bin/env bash
 # Builds the release binary and makes "dist/Better Finder.app".
 # The script signs the bundle ad hoc (no developer identity).
+#
+# Usage: scripts/bundle.sh [--install]
+#   --install  Also copy the app to /Applications, so that Spotlight,
+#              Raycast, and Launchpad find it.
 set -euo pipefail
+
+install=false
+case "${1:-}" in
+    --install) install=true ;;
+    "") ;;
+    *) echo "usage: scripts/bundle.sh [--install]" >&2; exit 2 ;;
+esac
 
 cd "$(dirname "$0")/.."
 
@@ -14,6 +25,8 @@ app="dist/Better Finder.app"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp target/release/better-finder "$app/Contents/MacOS/better-finder"
+# scripts/make-icon.swift makes the icon file.
+cp assets/AppIcon.icns "$app/Contents/Resources/AppIcon.icns"
 
 cat > "$app/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -28,6 +41,8 @@ cat > "$app/Contents/Info.plist" <<EOF
     <string>com.p1ratedev.better-finder</string>
     <key>CFBundleExecutable</key>
     <string>better-finder</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleInfoDictionaryVersion</key>
@@ -50,3 +65,20 @@ EOF
 
 codesign --force --sign - "$app"
 echo "Built $app (version $version)"
+
+if $install; then
+    target="/Applications/Better Finder.app"
+    # Replace only an earlier copy of this app, never a different app.
+    if [ -e "$target" ]; then
+        id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$target/Contents/Info.plist" 2>/dev/null || true)"
+        if [ "$id" != "com.p1ratedev.better-finder" ]; then
+            echo "error: $target exists and is not Better Finder ($id)" >&2
+            exit 1
+        fi
+        rm -rf "$target"
+    fi
+    ditto "$app" "$target"
+    # Tell Launch Services about the new copy, so that the icon updates.
+    /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$target"
+    echo "Installed $target"
+fi
