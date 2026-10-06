@@ -70,6 +70,7 @@ The public API of `bf-core` is the contract with `bf-app`. The doc comments in t
 | `smooth` | The smooth scroll driver for the list and the help overlay. A display link moves the clip view and the cursor highlight with an ease-out curve. |
 | `file_ops` | File system helpers with data-safety rules, for example a rename that never replaces an item. |
 | `quicklook` | `QLPreviewPanel` data source and delegate. |
+| `editor` | Opens a text file in the `editor` command, in a new window of Ghostty or Terminal. It runs `osascript`. The effect is `OpenFile`; a background thread checks for text. |
 | `icons` | File icons from `NSWorkspace`, with a cache. Each icon renders one time into a bitmap at the draw size. |
 | `theme` | `Rgba` to `NSColor`, fonts, row metrics. |
 | `loader` | Runs `bf_core::fs::read_dir` on a background thread. Sends the result to the main queue. |

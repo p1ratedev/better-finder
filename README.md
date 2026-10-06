@@ -60,6 +60,7 @@ directories-first = true
 columns = size,kind,modified
 date-format = finder
 terminal = Ghostty
+editor = nvim
 
 # Scroll
 smooth-scroll = true
@@ -71,6 +72,8 @@ keybind = d=unbind
 keybind = ctrl+n=cursor_down
 keybind = ctrl+p=cursor_up
 ```
+
+When `editor` is set, `Enter` opens a text file in that editor in a new window of the `terminal` app (Ghostty or Terminal). Other files open in the default app. macOS asks once to allow Better Finder to control the terminal app.
 
 These commands print reference information:
 

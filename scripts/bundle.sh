@@ -55,6 +55,8 @@ cat > "$app/Contents/Info.plist" <<EOF
     <string>13.0</string>
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.productivity</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Better Finder opens text files in your editor in a terminal window.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSPrincipalClass</key>

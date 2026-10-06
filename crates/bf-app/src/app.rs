@@ -12,7 +12,7 @@
 
 use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
-use std::io;
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
@@ -43,6 +43,7 @@ use objc2_foundation::{
 
 use crate::columns;
 use crate::debug::{self, trace};
+use crate::editor;
 use crate::file_ops::{self, VolumeInfo};
 use crate::header::{self, HeaderView};
 use crate::help::HelpModel;
@@ -886,6 +887,13 @@ fn help_scroll(motion: Motion, label: &str) {
 /// Work for AppKit that must run after the state borrow ends.
 enum Effect {
     OpenFile(PathBuf),
+    /// Open a file in `editor`, in a new window of the `terminal` app, when
+    /// the file is a text file. Open other files in the default app.
+    EditFile {
+        path: PathBuf,
+        editor: String,
+        terminal: String,
+    },
     Reveal(PathBuf),
     QuickLookToggle,
     QuickLookClose,
@@ -924,6 +932,11 @@ fn run_effects(mtm: MainThreadMarker, effects: Vec<Effect>) {
     for effect in effects {
         match effect {
             Effect::OpenFile(path) => open_file(&path),
+            Effect::EditFile {
+                path,
+                editor,
+                terminal,
+            } => open_text_or_default(path, editor, terminal),
             Effect::Reveal(path) => {
                 if let Some(url) = NSURL::from_file_path(&path) {
                     let urls = NSArray::from_retained_slice(&[url]);
@@ -1202,6 +1215,35 @@ fn open_file(path: &Path) {
     }
 }
 
+/// Opens `path` in `editor` when it is a text file, else in its default app.
+/// The text check reads the start of the file. That read can wait for the
+/// network or for an iCloud download, so it runs on a background thread. The
+/// result goes back to the main queue.
+fn open_text_or_default(path: PathBuf, editor: String, terminal: String) {
+    std::thread::spawn(move || {
+        let is_text = bf_core::fs::is_text_file(&path);
+        after_now(move || {
+            if is_text {
+                open_in_editor(&path, &editor, &terminal);
+            } else {
+                open_file(&path);
+            }
+        });
+    });
+}
+
+/// Opens `path` in `editor`, in a new window of the `terminal` app.
+fn open_in_editor(path: &Path, editor: &str, terminal: &str) {
+    let Some(args) = editor::osascript_command(path, editor, terminal) else {
+        show_error("The editor setting needs terminal = Ghostty or Terminal".to_string());
+        return;
+    };
+    let failure = format!("Cannot open \"{}\" in {}", file_name(path), editor.trim());
+    if let Err(err) = spawn_checked("/usr/bin/osascript", &args, failure) {
+        show_error(format!("Cannot run osascript: {err}"));
+    }
+}
+
 fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -1420,6 +1462,22 @@ impl AppState {
         self.refresh_after_change();
     }
 
+    /// The effect that opens a file. With `editor` set, a text file opens in the editor.
+    /// Every other file opens in the default app. This function does no disk IO:
+    /// the text check runs later, on a background thread.
+    fn open_file_effect(&self, path: PathBuf) -> Effect {
+        let editor = &self.config.editor;
+        if !editor.trim().is_empty() {
+            Effect::EditFile {
+                path,
+                editor: editor.clone(),
+                terminal: self.config.terminal.clone(),
+            }
+        } else {
+            Effect::OpenFile(path)
+        }
+    }
+
     fn current_or_cwd(&self) -> PathBuf {
         self.pane
             .current()
@@ -1444,7 +1502,7 @@ impl AppState {
             | Action::HalfPageDown => self.page_motion(&action),
             Action::Open => match self.pane.open_current() {
                 OpenOutcome::Navigate(request) => self.start_load(request),
-                OpenOutcome::OpenFile(path) => fx.push(Effect::OpenFile(path)),
+                OpenOutcome::OpenFile(path) => fx.push(self.open_file_effect(path)),
                 OpenOutcome::Nothing => {}
             },
             Action::Parent => {
@@ -1786,15 +1844,32 @@ fn copy_to_pasteboard(text: &str) -> bool {
 /// Runs `/usr/bin/open` with `args` and does not wait. A thread waits for
 /// the exit and shows `failure` when `open` fails.
 fn spawn_open(args: &[OsString], failure: String) -> io::Result<()> {
-    let mut child = Command::new("/usr/bin/open")
+    spawn_checked("/usr/bin/open", args, failure)
+}
+
+/// Runs `program` with `args` and does not wait. A thread waits for the exit.
+/// When the program fails, the thread shows `failure` and the first line of stderr.
+fn spawn_checked(program: &str, args: &[OsString], failure: String) -> io::Result<()> {
+    let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()?;
     std::thread::spawn(move || {
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            // A read error leaves the text empty. The exit status still decides.
+            let _ = pipe.read_to_string(&mut stderr);
+        }
         if child.wait().is_ok_and(|status| !status.success()) {
-            after_now(move || show_error(failure));
+            let detail = stderr.lines().next().unwrap_or("").trim();
+            let text = if detail.is_empty() {
+                failure
+            } else {
+                format!("{failure}: {detail}")
+            };
+            after_now(move || show_error(text));
         }
     });
     Ok(())
