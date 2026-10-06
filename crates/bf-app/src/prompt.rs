@@ -1,15 +1,19 @@
-//! The prompt: one `NSTextField` line above the status bar, with a label.
-//! It serves the filter, "go to folder", rename, and new folder.
+//! The text inputs of the app, with one shared delegate:
+//! - The bottom prompt: one `NSTextField` line above the status bar, with a
+//!   label. It serves "go to folder", and the filter when the toolbar is off.
+//! - The inline rename field over the name of the cursor row.
+//! - The toolbar filter field (it lives in `toolbar`, with this delegate).
 
 use std::cell::OnceCell;
 use std::path::PathBuf;
 
 use objc2::rc::Retained;
-use objc2::runtime::Sel;
+use objc2::runtime::{ProtocolObject, Sel};
 use objc2::{ClassType, DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSBezierPath, NSColor, NSControl, NSControlTextEditingDelegate, NSFocusRingType, NSResponder,
-    NSTextField, NSTextFieldDelegate, NSTextView, NSView, NSWindow,
+    NSSearchField, NSSearchFieldDelegate, NSTextField, NSTextFieldDelegate, NSTextView, NSView,
+    NSWindow,
 };
 use objc2_foundation::{
     MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRange, NSRect, NSSize,
@@ -29,11 +33,6 @@ pub enum PromptMode {
     Rename {
         source: PathBuf,
     },
-    /// `dir` is the directory of the new folder, from the time the prompt
-    /// opened.
-    NewFolder {
-        dir: PathBuf,
-    },
 }
 
 impl PromptMode {
@@ -42,7 +41,6 @@ impl PromptMode {
             PromptMode::Filter => "/",
             PromptMode::Goto => "Go to:",
             PromptMode::Rename { .. } => "Rename:",
-            PromptMode::NewFolder { .. } => "New folder:",
         }
     }
 }
@@ -73,9 +71,9 @@ define_class!(
         fn draw_rect(&self, _dirty: NSRect) {
             let bounds = self.bounds();
             app::with_ref(|s| {
-                s.style.status_bg.setFill();
+                s.style.colors.bar_bg.setFill();
                 NSBezierPath::fillRect(bounds);
-                s.style.border.setFill();
+                s.style.colors.separator.setFill();
                 let line = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(bounds.size.width, 1.0));
                 NSBezierPath::fillRect(line);
             });
@@ -138,13 +136,19 @@ define_class!(
     unsafe impl NSControlTextEditingDelegate for PromptDelegate {
         #[unsafe(method(controlTextDidChange:))]
         fn control_text_did_change(&self, notification: &NSNotification) {
-            let object = notification.object();
-            let text = object
-                .and_then(|o| o.downcast::<NSTextField>().ok())
-                .map(|field| field.stringValue().to_string());
-            if let Some(text) = text {
-                app::prompt_changed(text);
+            let Some(object) = notification.object() else {
+                return;
+            };
+            let is_search = object.downcast_ref::<NSSearchField>().is_some();
+            if let Ok(field) = object.downcast::<NSTextField>() {
+                app::prompt_changed(field.stringValue().to_string(), is_search);
             }
+        }
+
+        #[unsafe(method(controlTextDidEndEditing:))]
+        fn control_text_did_end_editing(&self, _notification: &NSNotification) {
+            // AppKit is in the middle of a first responder change.
+            app::after_now(app::prompt_end_editing);
         }
 
         #[unsafe(method(control:textView:doCommandBySelector:))]
@@ -177,10 +181,13 @@ define_class!(
 
     // SAFETY: `NSTextFieldDelegate` has no safety requirements. The signatures match.
     unsafe impl NSTextFieldDelegate for PromptDelegate {}
+
+    // SAFETY: `NSSearchFieldDelegate` has no safety requirements. The signatures match.
+    unsafe impl NSSearchFieldDelegate for PromptDelegate {}
 );
 
 impl PromptDelegate {
-    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+    pub fn new(mtm: MainThreadMarker) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(());
         // SAFETY: `init` is the designated initializer of NSObject.
         unsafe { msg_send![super(this), init] }
@@ -190,14 +197,17 @@ impl PromptDelegate {
 /// The views and the delegate of the prompt.
 #[derive(Clone)]
 pub struct PromptUi {
+    /// The bottom prompt: the filter without a toolbar, and "go to".
     pub bar: Retained<PromptBar>,
     pub label: Retained<NSTextField>,
     pub field: Retained<NSTextField>,
-    /// The field keeps only a weak reference to its delegate.
+    /// The rename field over the name of the cursor row.
+    pub inline: Retained<NSTextField>,
+    /// The fields keep only a weak reference to their delegate.
     pub _delegate: Retained<PromptDelegate>,
 }
 
-pub fn create(mtm: MainThreadMarker) -> PromptUi {
+pub fn create(mtm: MainThreadMarker, delegate: &Retained<PromptDelegate>) -> PromptUi {
     let bar = PromptBar::new(mtm);
     let label = NSTextField::labelWithString(&NSString::from_str(""), mtm);
     let field = NSTextField::textFieldWithString(&NSString::from_str(""), mtm);
@@ -205,9 +215,22 @@ pub fn create(mtm: MainThreadMarker) -> PromptUi {
     field.setBordered(false);
     field.setDrawsBackground(false);
     field.setFocusRingType(NSFocusRingType::None);
-    let delegate = PromptDelegate::new(mtm);
-    // SAFETY: `PromptUi` keeps the delegate alive as long as the field.
-    unsafe { field.setDelegate(Some(objc2::runtime::ProtocolObject::from_ref(&*delegate))) };
+    let inline = NSTextField::textFieldWithString(&NSString::from_str(""), mtm);
+    inline.setBezeled(false);
+    inline.setBordered(true);
+    inline.setDrawsBackground(true);
+    inline.setBackgroundColor(Some(&NSColor::textBackgroundColor()));
+    inline.setTextColor(Some(&NSColor::textColor()));
+    inline.setFocusRingType(NSFocusRingType::Exterior);
+    if let Some(cell) = inline.cell() {
+        cell.setScrollable(true);
+        cell.setWraps(false);
+    }
+    // SAFETY: `PromptUi` keeps the delegate alive as long as the fields.
+    unsafe {
+        field.setDelegate(Some(ProtocolObject::from_ref(&**delegate)));
+        inline.setDelegate(Some(ProtocolObject::from_ref(&**delegate)));
+    }
     bar.addSubview(&label);
     bar.addSubview(&field);
     let _ = bar.ivars().label.set(label.clone());
@@ -216,7 +239,51 @@ pub fn create(mtm: MainThreadMarker) -> PromptUi {
         bar,
         label,
         field,
-        _delegate: delegate,
+        inline,
+        _delegate: delegate.clone(),
+    }
+}
+
+/// Puts the keyboard focus in `field` with `text`, and selects a UTF-16
+/// range (start, length). The window becomes the key window first: the
+/// Quick Look panel can be the key window, and typed text must go here.
+pub fn focus_field(
+    window: &NSWindow,
+    field: &NSTextField,
+    text: &str,
+    select: (usize, usize),
+    caret: &NSColor,
+) {
+    field.setStringValue(&NSString::from_str(text));
+    window.makeKeyWindow();
+    let responder: &NSResponder = field.as_super().as_super().as_super();
+    window.makeFirstResponder(Some(responder));
+    if let Some(editor) = field.currentEditor() {
+        editor.setSelectedRange(NSRange::new(select.0, select.1));
+        if let Ok(view) = editor.downcast::<NSTextView>() {
+            view.setInsertionPointColor(Some(caret));
+        }
+    }
+}
+
+/// The current text of `field`, also while the field editor edits it.
+pub fn field_text(field: &NSTextField) -> String {
+    match field.currentEditor() {
+        Some(editor) => editor.string().to_string(),
+        None => field.stringValue().to_string(),
+    }
+}
+
+/// Replaces the text of `field` while the field editor edits it, and puts
+/// the insertion point at the end.
+pub fn replace_field_text(field: &NSTextField, text: &str) {
+    let value = NSString::from_str(text);
+    match field.currentEditor() {
+        Some(editor) => {
+            editor.setString(&value);
+            editor.setSelectedRange(NSRange::new(value.length(), 0));
+        }
+        None => field.setStringValue(&value),
     }
 }
 
@@ -224,60 +291,17 @@ impl PromptUi {
     /// Applies the fonts and colors of `style`.
     pub fn apply_style(&self, style: &Style) {
         self.label.setFont(Some(&style.font));
-        self.label.setTextColor(Some(&style.accent));
+        self.label.setTextColor(Some(&style.colors.accent));
         self.field.setFont(Some(&style.font));
-        self.field.setTextColor(Some(&style.foreground));
+        self.field.setTextColor(Some(&style.colors.name));
+        self.inline.setFont(Some(&style.font));
         self.bar.layout_fields();
         self.bar.setNeedsDisplay(true);
     }
 
-    /// Fills the prompt and moves the keyboard focus to the field.
-    /// `select` is a UTF-16 range (start, length) to select.
-    pub fn open(
-        &self,
-        window: &NSWindow,
-        label: &str,
-        text: &str,
-        select: (usize, usize),
-        caret: &NSColor,
-    ) {
+    /// Sets the label of the bottom prompt.
+    pub fn set_label(&self, label: &str) {
         self.label.setStringValue(&NSString::from_str(label));
-        self.field.setStringValue(&NSString::from_str(text));
         self.bar.layout_fields();
-        // The Quick Look panel can be the key window. Typed text must go to
-        // this window, so make it the key window first.
-        window.makeKeyWindow();
-        window.makeFirstResponder(Some(self.field_responder()));
-        if let Some(editor) = self.field.currentEditor() {
-            editor.setSelectedRange(NSRange::new(select.0, select.1));
-            if let Ok(view) = editor.downcast::<NSTextView>() {
-                view.setInsertionPointColor(Some(caret));
-            }
-        }
-    }
-
-    /// Replaces the text while the field is in edit mode, and puts the
-    /// insertion point at the end.
-    pub fn replace_text(&self, text: &str) {
-        let value = NSString::from_str(text);
-        match self.field.currentEditor() {
-            Some(editor) => {
-                editor.setString(&value);
-                editor.setSelectedRange(NSRange::new(value.length(), 0));
-            }
-            None => self.field.setStringValue(&value),
-        }
-    }
-
-    /// The current text of the field.
-    pub fn text(&self) -> String {
-        match self.field.currentEditor() {
-            Some(editor) => editor.string().to_string(),
-            None => self.field.stringValue().to_string(),
-        }
-    }
-
-    fn field_responder(&self) -> &NSResponder {
-        self.field.as_super().as_super().as_super()
     }
 }

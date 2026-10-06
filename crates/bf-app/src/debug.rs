@@ -68,6 +68,8 @@ pub enum Step {
     Wait(Duration),
     /// `@load`: wait until the next directory load completes.
     WaitLoad,
+    /// `@w<points>`: set the width of the window content.
+    Width(f64),
 }
 
 /// A scripted run: keys to feed, then an optional screenshot.
@@ -93,6 +95,13 @@ pub fn parse_keys(text: &str) -> Result<Vec<Step>, String> {
     for token in text.split_whitespace() {
         if token == "@load" {
             steps.push(Step::WaitLoad);
+            continue;
+        }
+        if let Some(width) = token.strip_prefix("@w") {
+            let width: f64 = width
+                .parse()
+                .map_err(|_| format!("--debug-keys: {token}: bad width"))?;
+            steps.push(Step::Width(width));
             continue;
         }
         if let Some(ms) = token.strip_prefix('@').filter(|ms| !ms.is_empty()) {
@@ -203,8 +212,15 @@ fn feed_key(event: KeyEvent, feed: Feed) {
         (Feed::Repeat, _) => {
             app::handle_key(event, true);
         }
-        (Feed::Keymap, _) | (Feed::Normal | Feed::NoWait, None) => {
+        (Feed::Keymap, _) => {
             app::handle_key(event, false);
+        }
+        (Feed::Normal | Feed::NoWait, None) => {
+            // Like the real key path: the sidebar gets the key first when
+            // it has the focus.
+            if !(app::sidebar_focused() && crate::sidebar::handle_key(&event)) {
+                app::handle_key(event, false);
+            }
         }
         (Feed::Normal | Feed::NoWait, Some(field)) => prompt_key(&field, &event),
     }
@@ -254,6 +270,14 @@ fn step() {
             // `^` keys follow in the same turn, before a load can complete.
             while let Some(Step::Key(event, feed)) = pop_step(true) {
                 feed_key(event, feed);
+            }
+            schedule_step();
+            return;
+        }
+        Some(Step::Width(width)) => {
+            if let Some(window) = app::with_ref(|s| s.ui.window.clone()) {
+                let height = window.contentRectForFrameRect(window.frame()).size.height;
+                window.setContentSize(objc2_foundation::NSSize::new(width, height));
             }
             schedule_step();
             return;
@@ -348,9 +372,18 @@ fn capture() {
     let Some(mtm) = MainThreadMarker::new() else {
         return;
     };
-    let result = render_png(mtm).and_then(|bytes| {
-        std::fs::write(&path, bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))
-    });
+    // `BETTER_FINDER_SCREENCAPTURE=1` captures the real window with
+    // `screencapture` (glass and layer colors render). It needs the screen
+    // recording permission of the terminal. The default renders the views
+    // offscreen, without a permission.
+    let result = if std::env::var_os("BETTER_FINDER_SCREENCAPTURE").is_some() {
+        screen_capture(&path)
+    } else {
+        render_png(mtm).and_then(|bytes| {
+            std::fs::write(&path, bytes)
+                .map_err(|e| format!("cannot write {}: {e}", path.display()))
+        })
+    };
     match result {
         Ok(()) => {
             eprintln!("screenshot: {}", path.display());
@@ -360,6 +393,29 @@ fn capture() {
             eprintln!("better-finder: screenshot failed: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+/// Captures the window on the screen with `/usr/sbin/screencapture`.
+fn screen_capture(path: &std::path::Path) -> Result<(), String> {
+    let window = app::with_ref(|s| s.ui.window.clone()).ok_or("no app state")?;
+    window.displayIfNeeded();
+    // SAFETY: `+[CATransaction flush]` takes no arguments and returns void.
+    unsafe {
+        let _: () = objc2::msg_send![objc2::class!(CATransaction), flush];
+    }
+    let id = window.windowNumber();
+    let status = std::process::Command::new("/usr/sbin/screencapture")
+        .arg("-x")
+        .arg("-o")
+        .arg(format!("-l{id}"))
+        .arg(path)
+        .status()
+        .map_err(|e| format!("cannot run screencapture: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("screencapture failed: {status}"))
     }
 }
 

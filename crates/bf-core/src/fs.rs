@@ -39,6 +39,8 @@ pub struct Entry {
     /// `lstat` size in bytes. Zero for directories.
     pub size: u64,
     pub modified: Option<SystemTime>,
+    /// The birth time from the same `lstat` (no extra syscall).
+    pub created: Option<SystemTime>,
     /// The name starts with `.`, or the `UF_HIDDEN` flag is set (like `~/Library`).
     pub hidden: bool,
     /// A regular file with any execute bit set.
@@ -131,7 +133,7 @@ fn build_entry(
 ) -> Entry {
     let name = name.to_string_lossy().into_owned();
     let mut hidden = name.starts_with('.');
-    let (kind, size, modified, executable) = match &metadata {
+    let (kind, size, modified, created, executable) = match &metadata {
         Ok(md) => {
             hidden |= md.st_flags() & UF_HIDDEN != 0;
             let file_type = md.file_type();
@@ -142,9 +144,21 @@ fn build_entry(
             } else {
                 md.len()
             };
-            (kind, size, md.modified().ok(), executable)
+            (
+                kind,
+                size,
+                md.modified().ok(),
+                md.created().ok(),
+                executable,
+            )
         }
-        Err(_) => (fallback.map_or(EntryKind::Other, kind_of), 0, None, false),
+        Err(_) => (
+            fallback.map_or(EntryKind::Other, kind_of),
+            0,
+            None,
+            None,
+            false,
+        ),
     };
     // Only a symlink needs a second call, to learn what it points at.
     let mut is_dir = match kind {
@@ -165,6 +179,7 @@ fn build_entry(
         is_package,
         size,
         modified,
+        created,
         hidden,
         executable,
     }
@@ -325,6 +340,7 @@ mod tests {
             (EntryKind::File, false, false, 5)
         );
         assert!(f.modified.is_some() && !f.hidden && !f.executable);
+        assert!(f.created.is_some());
         assert_eq!(f.path, root.join("file.txt"));
 
         let d = find(&entries, "sub");

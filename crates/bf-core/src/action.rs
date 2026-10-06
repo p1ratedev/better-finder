@@ -47,6 +47,10 @@ pub enum Action {
     Refresh,
     /// Show the key binding help overlay.
     Help,
+    /// Show or hide the sidebar.
+    ToggleSidebar,
+    /// Move the keyboard focus to the sidebar, or back to the list.
+    FocusSidebar,
 
     // File operations.
     Rename,
@@ -145,6 +149,8 @@ impl FromStr for Action {
             "toggle_sort_reverse" => Self::ToggleSortReverse,
             "refresh" => Self::Refresh,
             "help" => Self::Help,
+            "toggle_sidebar" => Self::ToggleSidebar,
+            "focus_sidebar" => Self::FocusSidebar,
             "rename" => Self::Rename,
             "new_folder" => Self::NewFolder,
             "trash" => Self::Trash,
@@ -190,6 +196,8 @@ impl fmt::Display for Action {
             Self::ToggleSortReverse => "toggle_sort_reverse",
             Self::Refresh => "refresh",
             Self::Help => "help",
+            Self::ToggleSidebar => "toggle_sidebar",
+            Self::FocusSidebar => "focus_sidebar",
             Self::Rename => "rename",
             Self::NewFolder => "new_folder",
             Self::Trash => "trash",
@@ -226,15 +234,20 @@ static CATALOG: &[(&str, &str)] = &[
     ("goto_prompt", "Show the go to folder prompt."),
     ("quick_look", "Show or hide the Quick Look panel."),
     ("toggle_hidden", "Show or hide hidden entries."),
-    ("filter", "Show the filter prompt."),
+    ("filter", "Focus the filter field."),
     ("cancel", "Cancel the most recent mode."),
     (
         "sort:<key>",
-        "Set the sort key: name, size, modified, or extension.",
+        "Set the sort key: name, size, modified, created, or extension.",
     ),
     ("toggle_sort_reverse", "Reverse the sort order."),
     ("refresh", "Read the directory again."),
     ("help", "Show the key binding help."),
+    ("toggle_sidebar", "Show or hide the sidebar."),
+    (
+        "focus_sidebar",
+        "Move the keyboard focus to the sidebar, or back to the list.",
+    ),
     ("rename", "Rename the entry under the cursor."),
     ("new_folder", "Make a new folder."),
     ("trash", "Move the entry under the cursor to the Trash."),
@@ -278,7 +291,7 @@ mod tests {
             assert_eq!(a.to_string().parse::<Action>().unwrap(), a);
             assert!(!a.description().is_empty(), "{a}");
         }
-        assert_eq!(all_actions().len(), 33);
+        assert_eq!(all_actions().len(), 35);
     }
 
     #[test]

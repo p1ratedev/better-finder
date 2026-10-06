@@ -5,16 +5,21 @@
 //! command lines start the app.
 
 mod app;
+mod columns;
 mod debug;
 mod file_ops;
+mod goto_panel;
+mod header;
 mod help;
 mod icons;
 mod list_view;
 mod loader;
 mod prompt;
 mod quicklook;
+mod sidebar;
 mod status_bar;
 mod theme;
+mod toolbar;
 mod watcher;
 mod window;
 
@@ -45,6 +50,7 @@ Developer options:
                                      @<ms> waits, @load waits for a load. Prefixes:
                                      ~ key repeat, ! keymap also with the prompt open,
                                      ^ same turn as the previous key (no wait for a load)
+  --debug-appearance light|dark      Force the appearance (for the system and auto themes)
 
 Environment:
   BETTER_FINDER_TRACE=1              Print timings to stderr
@@ -56,6 +62,7 @@ enum Command {
         path: Option<String>,
         screenshot: Option<PathBuf>,
         keys: Option<String>,
+        appearance: Option<bool>,
     },
     Help,
     Version,
@@ -71,6 +78,7 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
     let mut path = None;
     let mut screenshot = None;
     let mut keys = None;
+    let mut appearance = None;
     let mut command = None;
     let mut default = false;
     let mut iter = args.into_iter();
@@ -85,6 +93,13 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
             }
             "--debug-keys" => {
                 keys = Some(iter.next().ok_or("--debug-keys needs a list of triggers")?);
+            }
+            "--debug-appearance" => {
+                appearance = match iter.next().as_deref() {
+                    Some("light") => Some(false),
+                    Some("dark") => Some(true),
+                    _ => return Err("--debug-appearance needs light or dark".to_string()),
+                };
             }
             "+show-config" => command = Some(Command::ShowConfig { default: false }),
             "+list-keybinds" => command = Some(Command::ListKeybinds),
@@ -110,6 +125,7 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
             path,
             screenshot,
             keys,
+            appearance,
         }),
     }
 }
@@ -176,6 +192,7 @@ fn main() -> ExitCode {
             path,
             screenshot,
             keys,
+            appearance,
         } => {
             let keys = match keys.as_deref().map(debug::parse_keys).transpose() {
                 Ok(keys) => keys.unwrap_or_default(),
@@ -188,6 +205,7 @@ fn main() -> ExitCode {
                 path,
                 screenshot,
                 keys,
+                appearance,
             })
         }
     }

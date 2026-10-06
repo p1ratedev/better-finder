@@ -26,6 +26,8 @@ pub struct Delivery {
     /// The directory is on a local volume. Only then the app asks for
     /// path-specific icons and the title bar proxy icon.
     pub is_local: bool,
+    /// The volume of the directory, for the path bar.
+    pub volume: Option<file_ops::VolumeInfo>,
 }
 
 /// Reads `request.path` on a new thread. The thread sorts the entries with
@@ -55,14 +57,20 @@ fn run_thread(
             let mut result = bf_core::fs::read_dir(&thread_request.path);
             if let Ok(entries) = &mut result {
                 sort_entries(entries, sort);
+                crate::columns::prefetch_kinds(entries);
             }
             let read_time = started.elapsed();
             let is_local = result.is_ok() && file_ops::is_local_volume(&thread_request.path);
+            let volume = result
+                .is_ok()
+                .then(|| file_ops::volume_info(&thread_request.path))
+                .flatten();
             let delivery = Delivery {
                 request: thread_request,
                 result,
                 read_time,
                 is_local,
+                volume,
             };
             let deliver = thread_deliver
                 .lock()
@@ -84,6 +92,7 @@ fn run_thread(
                 result,
                 read_time: Duration::ZERO,
                 is_local: false,
+                volume: None,
             });
         }
     }

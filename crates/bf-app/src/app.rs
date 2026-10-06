@@ -30,33 +30,62 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{ClassType, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSAppearanceCustomization, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
-    NSEventModifierFlags, NSMenu, NSMenuItem, NSPasteboard, NSPasteboardTypeString, NSResponder,
-    NSWindow, NSWorkspace,
+    NSAnimatablePropertyContainer, NSAppearanceCustomization, NSApplication,
+    NSApplicationActivationPolicy, NSApplicationDelegate, NSEventModifierFlags, NSMenu, NSMenuItem,
+    NSPasteboard, NSPasteboardTypeString, NSResponder, NSWindow, NSWindowDelegate, NSWorkspace,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSFileManager, NSNotification, NSObject, NSObjectProtocol, NSString,
     NSURL,
 };
 
+use crate::columns;
 use crate::debug::{self, trace};
-use crate::file_ops;
+use crate::file_ops::{self, VolumeInfo};
+use crate::header::{self, HeaderView};
 use crate::help::HelpModel;
 use crate::icons;
 use crate::list_view::ListView;
 use crate::loader::{self, Delivery};
-use crate::prompt::PromptMode;
+use crate::prompt::{self, PromptMode};
 use crate::quicklook;
+use crate::sidebar;
 use crate::status_bar::StatusBar;
 use crate::theme::{self, Style};
 use crate::watcher;
 use crate::window::{self, Ui};
+
+/// Where the text input of a prompt is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromptPlace {
+    /// The bottom prompt bar.
+    Bar,
+    /// The filter field in the toolbar.
+    Search,
+    /// The rename field over the name of the cursor row.
+    Inline,
+    /// The floating "go to" panel.
+    Panel,
+}
+
+/// The matches of the "go to" panel.
+#[derive(Default)]
+struct GotoState {
+    /// The folder part of the text, as typed (for example `~/Doc` gives `~/`).
+    dir_text: String,
+    matches: Vec<String>,
+    selected: Option<usize>,
+    /// The number of the most recent query. Old results are ignored.
+    query: u64,
+}
 
 /// The options of a normal app start, from the command line.
 pub struct RunOptions {
     pub path: Option<String>,
     pub screenshot: Option<PathBuf>,
     pub keys: Vec<debug::Step>,
+    /// `--debug-appearance`: force light (`false`) or dark (`true`).
+    pub appearance: Option<bool>,
 }
 
 /// A status bar message. Info messages fade after 3 s. Errors stay until
@@ -91,6 +120,8 @@ struct Rendered {
     len: usize,
     current: Option<PathBuf>,
     row_height: f64,
+    history: (bool, bool),
+    sort: Option<bf_core::sort::SortOptions>,
 }
 
 /// All state of the app. Main thread only.
@@ -107,6 +138,12 @@ pub struct AppState {
     pub ui: Ui,
     config_files: Vec<PathBuf>,
     prompt: Option<PromptMode>,
+    prompt_place: PromptPlace,
+    /// The volume of the current directory, for the path bar.
+    pub volume: Option<VolumeInfo>,
+    /// Open the inline rename on this path after the next load (new folder).
+    pending_rename: Option<PathBuf>,
+    goto: GotoState,
     /// (directory, name): put the cursor on `name` after the next load of `directory`.
     pending_select: Option<(PathBuf, String)>,
     message_id: u64,
@@ -133,6 +170,8 @@ pub struct AppState {
     reveal_cursor: bool,
     rendered: Rendered,
     window_shown: bool,
+    /// The sidebar model that a thread builds at start.
+    sidebar_start: Option<sidebar::PendingModel>,
     /// `NSApplication` keeps only a weak reference to its delegate.
     _delegate: Retained<AppDelegate>,
 }
@@ -205,7 +244,28 @@ define_class!(
         }
     }
 
+    // SAFETY: `NSWindowDelegate` has no safety requirements. The signatures match.
+    unsafe impl NSWindowDelegate for AppDelegate {
+        #[unsafe(method(windowDidBecomeKey:))]
+        fn window_did_become_key(&self, _notification: &NSNotification) {
+            // The cursor row changes between the active and the inactive color.
+            redraw_list();
+        }
+
+        #[unsafe(method(windowDidResignKey:))]
+        fn window_did_resign_key(&self, _notification: &NSNotification) {
+            redraw_list();
+        }
+    }
+
     impl AppDelegate {
+        #[unsafe(method(systemColorsChanged:))]
+        fn system_colors_changed(&self, _notification: &NSNotification) {
+            // The accent color changed. The system colors are dynamic: a
+            // redraw shows the new color.
+            after_now(redraw_all);
+        }
+
         #[unsafe(method(openConfig:))]
         fn open_config_menu(&self, _sender: Option<&AnyObject>) {
             dispatch(Action::OpenConfig);
@@ -444,6 +504,10 @@ pub fn run(options: RunOptions) -> ExitCode {
     let generation = request.generation;
     let first_load = loader::spawn_first(request, config.sort);
     let load_started = Instant::now();
+    // The sidebar model needs disk access too: build it on a thread now.
+    let sidebar_start = config
+        .sidebar
+        .then(|| sidebar::spawn_build(config.sidebar_items.clone(), config.sidebar_locations));
 
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
@@ -451,13 +515,32 @@ pub fn run(options: RunOptions) -> ExitCode {
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
     let scripted = options.screenshot.is_some() || !options.keys.is_empty();
-    let window = window::create_window(mtm, &config, !scripted);
+    window::force_appearance(options.appearance);
+    let window = window::create_window(mtm, &config);
     window::apply_appearance(&window, config.theme);
-    let dark = theme::is_dark(&window.effectiveAppearance());
-    let (style, warnings) = Style::new(&config, dark);
-    let ui = window::create_views(mtm, &window);
+    let (style, warnings) = theme::style_for(&config, &window.effectiveAppearance());
+    trace!(
+        "startup: style after {} ms",
+        debug::since_start().as_millis()
+    );
+    let ui = window::create_views(mtm, &window, &config, !scripted);
     window.setTitle(&NSString::from_str(&display_path(&start)));
-    window::apply_look(&ui, &style, config.titlebar_style);
+    window.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+    window::apply_look(&ui, &style, &config);
+    trace!(
+        "startup: views after {} ms",
+        debug::since_start().as_millis()
+    );
+    // SAFETY: The notification name is an immutable static. The delegate
+    // lives as long as the app.
+    unsafe {
+        objc2_foundation::NSNotificationCenter::defaultCenter().addObserver_selector_name_object(
+            &delegate,
+            sel!(systemColorsChanged:),
+            Some(objc2_app_kit::NSSystemColorsDidChangeNotification),
+            None,
+        );
+    }
 
     let mut state = AppState {
         config,
@@ -470,6 +553,10 @@ pub fn run(options: RunOptions) -> ExitCode {
         ui,
         config_files: files,
         prompt: None,
+        prompt_place: PromptPlace::Bar,
+        volume: None,
+        pending_rename: None,
+        goto: GotoState::default(),
         pending_select: select.map(|name| (start, name)),
         message_id: 0,
         load_generation: generation,
@@ -485,6 +572,7 @@ pub fn run(options: RunOptions) -> ExitCode {
         reveal_cursor: true,
         rendered: Rendered::default(),
         window_shown: false,
+        sidebar_start,
         _delegate: delegate.clone(),
     };
     if let Some(text) = start_error.or_else(|| config_problem(&diagnostics, &warnings)) {
@@ -550,9 +638,12 @@ fn show_window() {
             return None;
         }
         s.window_shown = true;
-        Some(s.ui.clone())
+        let model = s.sidebar_start.take().and_then(|p| p.try_take());
+        Some((s.ui.clone(), model))
     });
-    let Some(Some(ui)) = shown else { return };
+    let Some(Some((ui, model))) = shown else {
+        return;
+    };
     ui.window.makeKeyAndOrderFront(None);
     ui.window.makeFirstResponder(Some(list_responder(&ui.list)));
     ui.window.displayIfNeeded();
@@ -561,6 +652,20 @@ fn show_window() {
     // SAFETY: `+[CATransaction flush]` takes no arguments and returns void.
     unsafe {
         let _: () = msg_send![objc2::class!(CATransaction), flush];
+    }
+    // The filter field and the sidebar rows come after the first frame:
+    // they cost about 25 ms, and the layout does not change when they come.
+    after_now(add_search_field);
+    if let Some(model) = model {
+        after_now(move || sidebar::apply_model(model));
+    }
+}
+
+fn add_search_field() {
+    let toolbar = with_ref(|s| s.config.toolbar.then(|| s.ui.toolbar.clone())).flatten();
+    if let Some(toolbar) = toolbar {
+        toolbar.add_search();
+        sync_ui();
     }
 }
 
@@ -649,13 +754,19 @@ enum Effect {
     QuickLookToggle,
     QuickLookClose,
     OpenPrompt {
+        place: PromptPlace,
         label: &'static str,
         text: String,
         select: (usize, usize),
     },
-    ClosePrompt,
+    ClosePrompt(PromptPlace),
     /// Show or hide the help overlay, as `AppState::help` says.
     Help,
+    ToggleSidebar,
+    /// Move the focus to the sidebar, or back to the list.
+    FocusSidebar,
+    /// Clear the text of the toolbar filter field.
+    ClearSearch,
     ReloadConfig,
     WatchConfig,
     Quit,
@@ -667,6 +778,7 @@ pub fn dispatch(action: Action) {
         return;
     };
     let ql_visible = quicklook::is_visible(mtm);
+    trace!("action: {action}");
     let effects = with(|s| s.perform(action, ql_visible)).unwrap_or_default();
     run_effects(mtm, effects);
     sync_ui();
@@ -685,23 +797,51 @@ fn run_effects(mtm: MainThreadMarker, effects: Vec<Effect>) {
             Effect::QuickLookToggle => quicklook::toggle(mtm),
             Effect::QuickLookClose => quicklook::close(mtm),
             Effect::OpenPrompt {
+                place,
                 label,
                 text,
                 select,
-            } => {
-                let Some((ui, caret)) = with_ref(|s| (s.ui.clone(), s.style.foreground.clone()))
-                else {
-                    continue;
-                };
-                ui.root.set_prompt_visible(true);
-                ui.prompt.open(&ui.window, label, &text, select, &caret);
-            }
-            Effect::ClosePrompt => {
+            } => open_prompt_view(place, label, &text, select),
+            Effect::ClosePrompt(place) => {
                 let Some(ui) = with_ref(|s| s.ui.clone()) else {
                     continue;
                 };
                 ui.window.makeFirstResponder(Some(list_responder(&ui.list)));
-                ui.root.set_prompt_visible(false);
+                match place {
+                    PromptPlace::Bar => ui.root.set_prompt_visible(false),
+                    PromptPlace::Search => {}
+                    PromptPlace::Inline => ui.prompt.inline.removeFromSuperview(),
+                    PromptPlace::Panel => ui.root.set_goto(None),
+                }
+            }
+            Effect::ToggleSidebar => {
+                let Some(ui) = with_ref(|s| s.ui.clone()) else {
+                    continue;
+                };
+                let collapse = !ui.sidebar_item.isCollapsed();
+                if collapse
+                    && ui.sidebar.outline.window().is_some_and(|w| {
+                        w.firstResponder().is_some_and(|r| {
+                            std::ptr::eq(
+                                Retained::as_ptr(&r).cast::<u8>(),
+                                Retained::as_ptr(&ui.sidebar.outline).cast::<u8>(),
+                            )
+                        })
+                    })
+                {
+                    ui.window.makeFirstResponder(Some(list_responder(&ui.list)));
+                }
+                ui.sidebar_item.animator().setCollapsed(collapse);
+                if !collapse {
+                    rebuild_sidebar();
+                }
+            }
+            Effect::FocusSidebar => focus_sidebar(),
+            Effect::ClearSearch => {
+                let field = with_ref(|s| s.ui.toolbar.search_field()).flatten();
+                if let Some(field) = field {
+                    field.setStringValue(&NSString::from_str(""));
+                }
             }
             Effect::Help => {
                 let Some((ui, height)) =
@@ -716,6 +856,176 @@ fn run_effects(mtm: MainThreadMarker, effects: Vec<Effect>) {
             Effect::WatchConfig => watch_config_files(),
             Effect::Quit => NSApplication::sharedApplication(mtm).terminate(None),
         }
+    }
+}
+
+/// Shows the text input of `place` and moves the keyboard focus to it.
+fn open_prompt_view(place: PromptPlace, label: &str, text: &str, select: (usize, usize)) {
+    let info = with_ref(|s| {
+        let layout = s.style.layout(s.ui.list.bounds().size.width);
+        let field_h = (s.style.line_height + 4.0).round();
+        (
+            s.ui.clone(),
+            s.style.colors.name.clone(),
+            s.pane.cursor(),
+            layout,
+            field_h,
+        )
+    });
+    let Some((ui, caret, cursor, layout, field_h)) = info else {
+        return;
+    };
+    match place {
+        PromptPlace::Bar => {
+            ui.root.set_prompt_visible(true);
+            ui.prompt.set_label(label);
+            prompt::focus_field(&ui.window, &ui.prompt.field, text, select, &caret);
+        }
+        PromptPlace::Search => {
+            ui.toolbar.begin_search();
+            if let Some(field) = ui.toolbar.search_field() {
+                prompt::focus_field(&ui.window, &field, text, select, &caret);
+            }
+        }
+        PromptPlace::Panel => {
+            with(|s| s.goto = GotoState::default());
+            ui.root.set_goto(Some(crate::goto_panel::height(0)));
+            if let Some(field) = ui.goto.field() {
+                prompt::focus_field(&ui.window, field, text, select, &caret);
+            }
+            goto_query(text.to_string());
+        }
+        PromptPlace::Inline => {
+            ui.list.scroll_to_row(cursor);
+            let frame = ui.list.name_field_frame(cursor, &layout, field_h);
+            ui.prompt.inline.setFrame(frame);
+            ui.list.addSubview(&ui.prompt.inline);
+            prompt::focus_field(&ui.window, &ui.prompt.inline, text, select, &caret);
+        }
+    }
+}
+
+/// Moves the keyboard focus to the sidebar (it shows the sidebar when it
+/// is hidden), or back to the list when the sidebar has it.
+fn focus_sidebar() {
+    let Some(ui) = with_ref(|s| s.ui.clone()) else {
+        return;
+    };
+    let outline_first = ui.window.firstResponder().is_some_and(|r| {
+        std::ptr::eq(
+            Retained::as_ptr(&r).cast::<u8>(),
+            Retained::as_ptr(&ui.sidebar.outline).cast::<u8>(),
+        )
+    });
+    if outline_first {
+        ui.window.makeFirstResponder(Some(list_responder(&ui.list)));
+        return;
+    }
+    if ui.sidebar_item.isCollapsed() {
+        ui.sidebar_item.setCollapsed(false);
+        rebuild_sidebar();
+    }
+    let responder: &NSResponder = ui
+        .sidebar
+        .outline
+        .as_super()
+        .as_super()
+        .as_super()
+        .as_super();
+    ui.window.makeFirstResponder(Some(responder));
+}
+
+/// True when the sidebar has the keyboard focus.
+pub fn sidebar_focused() -> bool {
+    with_ref(|s| {
+        s.ui.window.firstResponder().is_some_and(|r| {
+            std::ptr::eq(
+                Retained::as_ptr(&r).cast::<u8>(),
+                Retained::as_ptr(&s.ui.sidebar.outline).cast::<u8>(),
+            )
+        })
+    })
+    .unwrap_or(false)
+}
+
+/// Gives the keyboard focus back to the list.
+pub fn focus_list() {
+    if let Some(ui) = with_ref(|s| s.ui.clone()) {
+        ui.window.makeFirstResponder(Some(list_responder(&ui.list)));
+    }
+}
+
+/// A click on a sidebar row, or `enter` in the sidebar: go to `path` and
+/// give the focus back to the list.
+pub fn sidebar_open(path: PathBuf) {
+    focus_list();
+    dispatch(Action::Goto(path.to_string_lossy().into_owned()));
+}
+
+/// Selects the sidebar row of the current folder.
+pub fn sync_sidebar_selection() {
+    if let Some(cwd) = with_ref(|s| s.pane.cwd().to_path_buf()) {
+        sidebar::select_path(&cwd);
+    }
+}
+
+/// Builds the sidebar model again (volumes changed, or config reload).
+pub fn rebuild_sidebar() {
+    if let Some((items, locations)) =
+        with_ref(|s| (s.config.sidebar_items.clone(), s.config.sidebar_locations))
+    {
+        // `spawn_build` applies the model on the main queue when it is done.
+        let _pending = sidebar::spawn_build(items, locations);
+    }
+}
+
+/// A click on a column title: the sort column reverses the order, another
+/// column sorts by it in the normal direction.
+pub fn header_click(target: header::Target) {
+    let Some(key) = target.sort_key() else {
+        return;
+    };
+    let changed = with(|s| {
+        let mut sort = s.pane.sort();
+        if sort.key == key {
+            sort.reverse = !sort.reverse;
+        } else {
+            sort.key = key;
+            sort.reverse = false;
+        }
+        s.pane.set_sort(sort);
+        s.content_dirty = true;
+        s.reveal_cursor = true;
+    });
+    if changed.is_some() {
+        sync_ui();
+    }
+}
+
+/// Keeps the cursor row in view (for example after the toolbar changed).
+pub fn reveal_cursor() {
+    if let Some((list, cursor)) = with_ref(|s| (s.ui.list.clone(), s.pane.cursor())) {
+        list.scroll_to_row(cursor);
+    }
+}
+
+/// A scroll cancels the inline rename.
+pub fn cancel_inline_rename() {
+    let inline = with_ref(|s| {
+        s.prompt_place == PromptPlace::Inline && matches!(s.prompt, Some(PromptMode::Rename { .. }))
+    });
+    if inline == Some(true) {
+        prompt_cancel();
+    }
+}
+
+/// Redraws the list, the header, and the bars.
+pub fn redraw_all() {
+    if let Some(ui) = with_ref(|s| s.ui.clone()) {
+        ui.list.setNeedsDisplay(true);
+        ui.header.setNeedsDisplay(true);
+        ui.status.setNeedsDisplay(true);
+        ui.prompt.bar.setNeedsDisplay(true);
     }
 }
 
@@ -795,6 +1105,11 @@ impl AppState {
         });
     }
 
+    /// The matches of the "go to" panel and the selected one.
+    pub fn goto_matches(&self) -> (&[String], Option<usize>) {
+        (&self.goto.matches, self.goto.selected)
+    }
+
     /// True when the current directory is on a local volume.
     pub fn cwd_is_local(&self) -> bool {
         self.cwd_is_local
@@ -834,7 +1149,18 @@ impl AppState {
         fx: &mut Vec<Effect>,
     ) {
         let label = mode.label();
+        let place = match mode {
+            PromptMode::Filter if self.config.toolbar => PromptPlace::Search,
+            PromptMode::Rename { .. } => PromptPlace::Inline,
+            PromptMode::Goto => PromptPlace::Panel,
+            _ => PromptPlace::Bar,
+        };
+        // A prompt in another place closes first.
+        if self.prompt.is_some() && self.prompt_place != place {
+            fx.push(Effect::ClosePrompt(self.prompt_place));
+        }
         self.prompt = Some(mode);
+        self.prompt_place = place;
         // The Quick Look panel sends keys to the keymap. Close it, so that
         // the typed text goes only to the prompt.
         if ql_visible {
@@ -844,6 +1170,7 @@ impl AppState {
             fx.push(Effect::Help);
         }
         fx.push(Effect::OpenPrompt {
+            place,
             label,
             text,
             select,
@@ -852,7 +1179,44 @@ impl AppState {
 
     fn close_prompt(&mut self, fx: &mut Vec<Effect>) {
         self.prompt = None;
-        fx.push(Effect::ClosePrompt);
+        fx.push(Effect::ClosePrompt(self.prompt_place));
+    }
+
+    /// Makes a new folder at once (`untitled folder`, then `untitled
+    /// folder 2`, ...), selects it, and opens the inline rename on it after
+    /// the load, like Finder.
+    fn new_folder(&mut self) {
+        if self.refuse_while_navigating() {
+            return;
+        }
+        let dir = self.pane.cwd().to_path_buf();
+        let mut created = None;
+        for n in 1..1000 {
+            let name = if n == 1 {
+                "untitled folder".to_string()
+            } else {
+                format!("untitled folder {n}")
+            };
+            // `create_dir` fails when the name exists: it never replaces.
+            match std::fs::create_dir(dir.join(&name)) {
+                Ok(()) => {
+                    created = Some(name);
+                    break;
+                }
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    self.set_error(format!("Cannot create a folder: {err}"));
+                    return;
+                }
+            }
+        }
+        let Some(name) = created else {
+            self.set_error("Cannot find a free name for the new folder");
+            return;
+        };
+        self.pending_rename = Some(dir.join(&name));
+        self.pending_select = Some((dir, name));
+        self.refresh_after_change();
     }
 
     fn current_or_cwd(&self) -> PathBuf {
@@ -971,17 +1335,9 @@ impl AppState {
                     self.open_prompt(mode, name, select, ql_visible, &mut fx);
                 }
             }
-            Action::NewFolder => {
-                if self.refuse_while_navigating() {
-                    return fx;
-                }
-                let text = "untitled folder".to_string();
-                let select = (0, utf16_len(&text));
-                let mode = PromptMode::NewFolder {
-                    dir: self.pane.cwd().to_path_buf(),
-                };
-                self.open_prompt(mode, text, select, ql_visible, &mut fx);
-            }
+            Action::NewFolder => self.new_folder(),
+            Action::ToggleSidebar => fx.push(Effect::ToggleSidebar),
+            Action::FocusSidebar => fx.push(Effect::FocusSidebar),
             Action::Trash => self.trash(),
             Action::CopyPath => {
                 let path = self.current_or_cwd();
@@ -1089,6 +1445,13 @@ impl AppState {
         match mode {
             PromptMode::Filter => self.close_prompt(&mut fx),
             PromptMode::Goto => {
+                // The selected match of the panel wins over the text.
+                let selected = self
+                    .goto
+                    .selected
+                    .and_then(|i| self.goto.matches.get(i))
+                    .map(|name| format!("{}{name}", self.goto.dir_text));
+                let text = selected.unwrap_or(text);
                 let input = text.trim();
                 if input.is_empty() {
                     self.close_prompt(&mut fx);
@@ -1136,27 +1499,6 @@ impl AppState {
                         self.set_error(format!("\"{text}\" already exists"));
                     }
                     Err(err) => self.set_error(format!("Cannot rename \"{old_text}\": {err}")),
-                }
-            }
-            PromptMode::NewFolder { dir } => {
-                if let Err(problem) = check_name(&text) {
-                    self.set_error(problem);
-                    return fx;
-                }
-                if self.refuse_while_navigating() {
-                    return fx;
-                }
-                // `create_dir` fails when the name exists: it never replaces.
-                match std::fs::create_dir(dir.join(&text)) {
-                    Ok(()) => {
-                        self.close_prompt(&mut fx);
-                        self.pending_select = Some((dir, text));
-                        self.refresh_after_change();
-                    }
-                    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                        self.set_error(format!("\"{text}\" already exists"));
-                    }
-                    Err(err) => self.set_error(format!("Cannot create \"{text}\": {err}")),
                 }
             }
         }
@@ -1294,6 +1636,7 @@ pub fn finish_load(delivery: Delivery) {
         result,
         read_time,
         is_local,
+        volume,
     } = delivery;
     let started = Instant::now();
     let count = result.as_ref().map(Vec::len).unwrap_or(0);
@@ -1313,6 +1656,7 @@ pub fn finish_load(delivery: Delivery) {
             s.set_error(error);
         } else {
             s.cwd_is_local = is_local;
+            s.volume = volume;
         }
         let cwd = s.pane.cwd().to_path_buf();
         let dir_changed = (!was_loaded && s.pane.is_loaded()) || cwd != old_cwd;
@@ -1328,16 +1672,27 @@ pub fn finish_load(delivery: Delivery) {
             s.list_changed_at = Some(Instant::now());
         }
         let mut fx = Vec::new();
-        // A rename or a new folder applies to the directory where the
-        // prompt opened. When the directory changed, cancel the prompt.
-        if dir_changed
-            && matches!(
-                s.prompt,
-                Some(PromptMode::Rename { .. } | PromptMode::NewFolder { .. })
-            )
-        {
+        // A rename applies to the directory where the prompt opened. When
+        // the directory changed, cancel the prompt.
+        if dir_changed && matches!(s.prompt, Some(PromptMode::Rename { .. })) {
             s.close_prompt(&mut fx);
             s.set_info("The folder changed. The prompt closed.");
+        }
+        // A new folder: open the inline rename when its row is under the cursor.
+        if let Some(path) = s.pending_rename.take() {
+            let ready = failed.is_none()
+                && s.pane.current().is_some_and(|e| e.path == path)
+                && s.prompt.is_none();
+            if ready {
+                if let Some(entry) = s.pane.current() {
+                    let name = entry.name.clone();
+                    let select = (0, utf16_len(&name));
+                    let mode = PromptMode::Rename { source: path };
+                    s.open_prompt(mode, name, select, false, &mut fx);
+                }
+            } else if s.refresh_queued && path.parent() == Some(cwd.as_path()) {
+                s.pending_rename = Some(path);
+            }
         }
         if s.refresh_queued && !s.pane.is_loading() {
             s.refresh_queued = false;
@@ -1452,24 +1807,51 @@ pub fn list_did_focus() {
 
 // ---- Prompt callbacks ----
 
-/// The prompt text field, when the prompt is open. For `--debug-keys`.
-pub fn prompt_field() -> Option<Retained<objc2_app_kit::NSTextField>> {
-    with_ref(|s| s.prompt.is_some().then(|| s.ui.prompt.field.clone())).flatten()
+/// The text field of `place`.
+fn place_field(ui: &Ui, place: PromptPlace) -> Option<Retained<objc2_app_kit::NSTextField>> {
+    match place {
+        PromptPlace::Bar => Some(ui.prompt.field.clone()),
+        PromptPlace::Inline => Some(ui.prompt.inline.clone()),
+        PromptPlace::Panel => ui.goto.field().cloned(),
+        PromptPlace::Search => ui.toolbar.search_field().map(Retained::into_super),
+    }
 }
 
-/// The text of the prompt changed. The filter updates the list live.
-pub fn prompt_changed(text: String) {
+/// The text field of the open prompt. For `--debug-keys` and completion.
+pub fn prompt_field() -> Option<Retained<objc2_app_kit::NSTextField>> {
+    with_ref(|s| {
+        s.prompt
+            .is_some()
+            .then(|| place_field(&s.ui, s.prompt_place))
+            .flatten()
+    })
+    .flatten()
+}
+
+/// The text of a prompt changed. The filter updates the list live. A
+/// change in the toolbar filter field opens the filter mode (the user can
+/// click into the field).
+pub fn prompt_changed(text: String, is_search: bool) {
     let changed = with(|s| {
+        if is_search && s.prompt.is_none() {
+            s.prompt = Some(PromptMode::Filter);
+            s.prompt_place = PromptPlace::Search;
+        }
+        if s.prompt == Some(PromptMode::Goto) && s.prompt_place == PromptPlace::Panel {
+            return None;
+        }
         if s.prompt != Some(PromptMode::Filter) {
-            return false;
+            return Some(false);
         }
         s.pane.set_filter(&text);
         s.content_dirty = true;
         s.reveal_cursor = true;
-        true
+        Some(true)
     });
-    if changed == Some(true) {
-        sync_ui();
+    match changed {
+        Some(Some(true)) => sync_ui(),
+        Some(None) => goto_query(text),
+        _ => {}
     }
 }
 
@@ -1493,6 +1875,7 @@ pub fn prompt_cancel() {
             Some(PromptMode::Filter) => {
                 s.pane.clear_filter();
                 s.content_dirty = true;
+                fx.push(Effect::ClearSearch);
             }
             Some(_) => {}
         }
@@ -1507,38 +1890,172 @@ pub fn prompt_cancel() {
     sync_ui();
 }
 
+/// The text field lost the focus (a click on another view). A rename
+/// cancels; the filter stays.
+pub fn prompt_end_editing() {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let field = with_ref(|s| {
+        s.prompt
+            .is_some()
+            .then(|| (place_field(&s.ui, s.prompt_place), s.ui.window.clone()))
+    })
+    .flatten();
+    let Some((Some(field), window)) = field else {
+        return;
+    };
+    // The field still has the focus when its field editor is the first
+    // responder (a selector command ends and starts the edit again).
+    let editing = field.currentEditor().is_some_and(|editor| {
+        window.firstResponder().is_some_and(|r| {
+            std::ptr::eq(
+                Retained::as_ptr(&r).cast::<u8>(),
+                Retained::as_ptr(&editor).cast::<u8>(),
+            )
+        })
+    });
+    if editing {
+        return;
+    }
+    let effects = with(|s| {
+        let mut fx = Vec::new();
+        if s.prompt.is_some() {
+            s.prompt = None;
+            if s.prompt_place == PromptPlace::Inline {
+                fx.push(Effect::ClosePrompt(PromptPlace::Inline));
+            } else if s.prompt_place == PromptPlace::Bar {
+                fx.push(Effect::ClosePrompt(PromptPlace::Bar));
+            }
+        }
+        fx
+    })
+    .unwrap_or_default();
+    run_effects(mtm, effects);
+    sync_ui();
+}
+
 /// Up and Down in the filter prompt move the list cursor.
 pub fn prompt_move(delta: isize) -> bool {
     let moved = with(|s| {
+        if s.prompt == Some(PromptMode::Goto) && s.prompt_place == PromptPlace::Panel {
+            // Up and Down select a match of the "go to" panel.
+            let count = s.goto.matches.len().min(crate::goto_panel::MAX_MATCHES);
+            if count == 0 {
+                return Some(false);
+            }
+            s.goto.selected = Some(match (s.goto.selected, delta > 0) {
+                (None, true) => 0,
+                (None, false) => count - 1,
+                (Some(i), true) => (i + 1).min(count - 1),
+                (Some(i), false) => i.saturating_sub(1),
+            });
+            return Some(true);
+        }
         if s.prompt != Some(PromptMode::Filter) {
-            return false;
+            return None;
         }
         s.pane.move_cursor(delta);
-        true
+        Some(false)
     })
-    .unwrap_or(false);
-    if moved {
-        sync_ui();
+    .flatten();
+    match moved {
+        Some(true) => {
+            if let Some(panel) = with_ref(|s| s.ui.goto.clone()) {
+                panel.setNeedsDisplay(true);
+            }
+            true
+        }
+        Some(false) => {
+            sync_ui();
+            true
+        }
+        None => false,
     }
-    moved
+}
+
+/// Splits the "go to" text into the folder part as typed, the name prefix,
+/// and the folder path: `~/Doc` gives `~/`, `Doc`, and the home folder.
+fn split_goto_text(text: &str, cwd: &Path) -> (String, String, PathBuf) {
+    let (dir_text, prefix) = match text.rfind('/') {
+        Some(i) => (text[..=i].to_string(), text[i + 1..].to_string()),
+        None if text == "~" => ("~/".to_string(), String::new()),
+        None => (String::new(), text.to_string()),
+    };
+    let dir = if dir_text.is_empty() {
+        cwd.to_path_buf()
+    } else {
+        expand_path(&dir_text, cwd)
+    };
+    (dir_text, prefix, dir)
+}
+
+/// Lists the folders that match the "go to" text, on a thread. The panel
+/// shows them when they arrive and the text is the same.
+fn goto_query(text: String) {
+    let info = with(|s| {
+        s.goto.query += 1;
+        (s.goto.query, s.pane.cwd().to_path_buf())
+    });
+    let Some((id, cwd)) = info else {
+        return;
+    };
+    let (dir_text, prefix, dir) = split_goto_text(&text, &cwd);
+    let spawned = std::thread::Builder::new()
+        .name("bf-goto-list".into())
+        .spawn(move || {
+            let mut names = matching_directories(&dir, &prefix);
+            names.sort_by(|a, b| bf_core::sort::natural_cmp(a, b));
+            names.truncate(crate::goto_panel::MAX_MATCHES);
+            after_now(move || goto_matches_arrived(id, dir_text, names));
+        });
+    if spawned.is_err() {
+        trace!("goto: cannot start a thread");
+    }
+}
+
+fn goto_matches_arrived(id: u64, dir_text: String, names: Vec<String>) {
+    let ui = with(|s| {
+        if s.goto.query != id || s.prompt != Some(PromptMode::Goto) {
+            return None;
+        }
+        s.goto.dir_text = dir_text;
+        s.goto.matches = names;
+        s.goto.selected = None;
+        Some((s.ui.clone(), s.goto.matches.len()))
+    })
+    .flatten();
+    if let Some((ui, count)) = ui {
+        ui.root.set_goto(Some(crate::goto_panel::height(count)));
+        ui.goto.setNeedsDisplay(true);
+    }
 }
 
 /// Tab in the "go to" prompt completes the directory name. The directory
 /// read runs on a background thread.
 pub fn prompt_complete(text: String) -> bool {
-    let cwd =
-        with_ref(|s| (s.prompt == Some(PromptMode::Goto)).then(|| s.pane.cwd().to_path_buf()));
-    let Some(Some(cwd)) = cwd else { return false };
-    let (dir_text, prefix) = match text.rfind('/') {
-        Some(i) => (text[..=i].to_string(), text[i + 1..].to_string()),
-        None if text == "~" => ("~/".to_string(), String::new()),
-        None => (String::new(), text.clone()),
+    let info = with_ref(|s| {
+        (s.prompt == Some(PromptMode::Goto)).then(|| {
+            let selected = s
+                .goto
+                .selected
+                .and_then(|i| s.goto.matches.get(i))
+                .map(|name| format!("{}{name}/", s.goto.dir_text));
+            (s.pane.cwd().to_path_buf(), selected)
+        })
+    });
+    let Some(Some((cwd, selected))) = info else {
+        return false;
     };
-    let dir = if dir_text.is_empty() {
-        cwd
-    } else {
-        expand_path(&dir_text, &cwd)
-    };
+    // A selected match of the panel completes to that folder.
+    if let Some(new_text) = selected {
+        if let Some(field) = prompt_field() {
+            prompt::replace_field_text(&field, &new_text);
+        }
+        goto_query(new_text);
+        return true;
+    }
+    let (dir_text, prefix, dir) = split_goto_text(&text, &cwd);
     std::thread::spawn(move || {
         let names = matching_directories(&dir, &prefix);
         if let Some(completion) = complete_name(&names, &prefix) {
@@ -1591,10 +2108,15 @@ fn complete_name(names: &[String], prefix: &str) -> Option<String> {
 }
 
 fn prompt_complete_result(original: String, new_text: String) {
-    let prompt = with_ref(|s| (s.prompt == Some(PromptMode::Goto)).then(|| s.ui.prompt.clone()));
-    let Some(Some(prompt)) = prompt else { return };
-    if prompt.text() == original {
-        prompt.replace_text(&new_text);
+    if with_ref(|s| s.prompt == Some(PromptMode::Goto)) != Some(true) {
+        return;
+    }
+    let Some(field) = prompt_field() else {
+        return;
+    };
+    if prompt::field_text(&field) == original {
+        prompt::replace_field_text(&field, &new_text);
+        goto_query(new_text);
     }
 }
 
@@ -1639,10 +2161,12 @@ fn apply_config(result: LoadResult) {
         return;
     };
     window::apply_appearance(&window, config.theme);
-    let dark = theme::is_dark(&window.effectiveAppearance());
-    let (style, warnings) = Style::new(&config, dark);
-    let titlebar = config.titlebar_style;
+    let (style, warnings) = theme::style_for(&config, &window.effectiveAppearance());
+    let new_config = config.clone();
     let ui = with(|s| {
+        let sidebar_changed = s.config.sidebar_items != config.sidebar_items
+            || s.config.sidebar_locations != config.sidebar_locations;
+        let sidebar_toggled = s.config.sidebar != config.sidebar;
         s.pane.set_show_hidden(config.show_hidden);
         s.pane.set_sort(config.sort);
         s.pane.set_filter_mode(config.filter_mode);
@@ -1659,10 +2183,19 @@ fn apply_config(result: LoadResult) {
             Some(problem) => s.set_error(problem),
             None => s.set_info("Config reloaded"),
         }
-        s.ui.clone()
+        (s.ui.clone(), sidebar_changed, sidebar_toggled)
     });
-    let Some(ui) = ui else { return };
-    window::apply_look(&ui, &style, titlebar);
+    let Some((ui, sidebar_changed, sidebar_toggled)) = ui else {
+        return;
+    };
+    columns::reset();
+    window::apply_look(&ui, &style, &new_config);
+    if sidebar_toggled {
+        ui.sidebar_item.setCollapsed(!new_config.sidebar);
+    }
+    if sidebar_changed || (sidebar_toggled && new_config.sidebar) {
+        rebuild_sidebar();
+    }
     if let Some(keymap) = with_ref(|s| s.config.keymap.clone()) {
         sync_menu_keys(&keymap);
     }
@@ -1679,27 +2212,27 @@ pub fn appearance_changed() {
     let Some((window, mode, was_dark)) = info else {
         return;
     };
-    if mode != ThemeMode::Auto {
+    if !matches!(mode, ThemeMode::Auto | ThemeMode::System) {
         return;
     }
-    let dark = theme::is_dark(&window.effectiveAppearance());
-    if dark == was_dark {
+    let appearance = window.effectiveAppearance();
+    if theme::is_dark(&appearance) == was_dark {
         return;
     }
     let updated = with(|s| {
-        let (style, _) = Style::new(&s.config, dark);
+        let (style, _) = theme::style_for(&s.config, &appearance);
         s.style = style.clone();
         if s.help.is_some() {
             s.help = Some(HelpModel::build(&s.config.keymap, &s.style));
         }
         s.content_dirty = true;
         s.rendered.valid = false;
-        (s.ui.clone(), style, s.config.titlebar_style)
+        (s.ui.clone(), style, s.config.clone())
     });
-    let Some((ui, style, titlebar)) = updated else {
+    let Some((ui, style, config)) = updated else {
         return;
     };
-    window::apply_look(&ui, &style, titlebar);
+    window::apply_look(&ui, &style, &config);
     sync_ui();
 }
 
@@ -1711,11 +2244,28 @@ enum Redraw {
     All,
 }
 
+/// What to do with the inline rename field after a list change.
+enum InlinePlan {
+    /// Put it over this row.
+    Move(usize),
+    /// The renamed item is not in the list now: close the field.
+    Close,
+}
+
 /// The AppKit work to bring the views up to date with the state.
 struct UiPlan {
+    ui: Ui,
     window: Retained<NSWindow>,
     list: Retained<ListView>,
     status: Retained<StatusBar>,
+    header: Retained<HeaderView>,
+    redraw_header: bool,
+    history: Option<(bool, bool)>,
+    sidebar_path: Option<PathBuf>,
+    /// The filter text for the toolbar field, when the field does not edit.
+    search_text: Option<String>,
+    inline: Option<InlinePlan>,
+    inline_layout: Option<(theme::ColumnLayout, f64)>,
     metrics: Option<(usize, f64)>,
     redraw: Redraw,
     scroll_to: Option<usize>,
@@ -1745,20 +2295,61 @@ impl AppState {
         let scroll_to = (self.reveal_cursor || dir_changed || cursor_changed).then_some(cursor);
         let title = dir_changed.then(|| (display_path(&cwd), cwd.clone(), self.cwd_is_local));
         let quick_look_reload = dir_changed || r.current != current;
+        let history = (self.pane.can_go_back(), self.pane.can_go_forward());
+        let sort = self.pane.sort();
+        let redraw_header = self.content_dirty || r.sort != Some(sort) || layout_changed;
+        let history_changed = !r.valid || r.history != history;
+        let content_changed = self.content_dirty || layout_changed;
+        let editing_search =
+            self.prompt == Some(PromptMode::Filter) && self.prompt_place == PromptPlace::Search;
+        let search_text = (!editing_search).then(|| self.pane.filter().to_string());
+        let mut inline = None;
+        if content_changed && self.prompt_place == PromptPlace::Inline {
+            if let Some(PromptMode::Rename { source }) = &self.prompt {
+                let row = (0..len).find(|&i| {
+                    self.pane
+                        .visible_entry(i)
+                        .is_some_and(|e| &e.path == source)
+                });
+                inline = Some(match row {
+                    Some(row) => InlinePlan::Move(row),
+                    None => {
+                        self.prompt = None;
+                        InlinePlan::Close
+                    }
+                });
+            }
+        }
+        let inline_layout = inline.as_ref().map(|_| {
+            (
+                self.style.layout(self.ui.list.bounds().size.width),
+                (self.style.line_height + 4.0).round(),
+            )
+        });
         self.content_dirty = false;
         self.reveal_cursor = false;
         self.rendered = Rendered {
             valid: true,
-            cwd,
+            cwd: cwd.clone(),
             cursor,
             len,
             current,
             row_height,
+            history,
+            sort: Some(sort),
         };
         UiPlan {
+            ui: self.ui.clone(),
             window: self.ui.window.clone(),
             list: self.ui.list.clone(),
             status: self.ui.status.clone(),
+            header: self.ui.header.clone(),
+            redraw_header,
+            history: history_changed.then_some(history),
+            sidebar_path: dir_changed.then_some(cwd),
+            search_text,
+            inline,
+            inline_layout,
             metrics: layout_changed.then_some((len, row_height)),
             redraw,
             scroll_to,
@@ -1785,6 +2376,34 @@ impl UiPlan {
             self.list.scroll_to_row(row);
         }
         self.status.setNeedsDisplay(true);
+        if self.redraw_header {
+            self.header.setNeedsDisplay(true);
+        }
+        if let Some((back, forward)) = self.history {
+            self.ui.toolbar.set_navigation(back, forward);
+        }
+        if let Some(path) = &self.sidebar_path {
+            sidebar::select_path(path);
+        }
+        if let Some(text) = &self.search_text {
+            if let Some(field) = self.ui.toolbar.search_field() {
+                if field.stringValue().to_string() != *text {
+                    field.setStringValue(&NSString::from_str(text));
+                }
+            }
+        }
+        match (self.inline, self.inline_layout) {
+            (Some(InlinePlan::Move(row)), Some((layout, field_h))) => {
+                let frame = self.list.name_field_frame(row, &layout, field_h);
+                self.ui.prompt.inline.setFrame(frame);
+            }
+            (Some(InlinePlan::Close), _) => {
+                self.window
+                    .makeFirstResponder(Some(list_responder(&self.list)));
+                self.ui.prompt.inline.removeFromSuperview();
+            }
+            _ => {}
+        }
         if let Some((title, path, is_local)) = self.title {
             self.window.setTitle(&NSString::from_str(&title));
             if is_local {

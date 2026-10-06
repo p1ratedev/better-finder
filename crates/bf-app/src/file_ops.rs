@@ -7,7 +7,7 @@ use std::ffi::CString;
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn c_path(path: &Path) -> io::Result<CString> {
     CString::new(path.as_os_str().as_bytes())
@@ -84,6 +84,56 @@ pub fn is_local_volume(path: &Path) -> bool {
     status == 0 && info.f_flags & (libc::MNT_LOCAL as u32) != 0
 }
 
+/// The volume of a directory, for the path bar.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VolumeInfo {
+    /// The root of the volume, as the path bar shows it (`/` for the boot
+    /// volume, also when the data volume holds the folder).
+    pub mount: PathBuf,
+    /// The localized volume name, for example `Macintosh HD`.
+    pub name: String,
+    /// The free bytes for a normal user (`f_bavail`).
+    pub free: u64,
+}
+
+/// The volume of `path`. It accesses the disk: call it on a background
+/// thread.
+pub fn volume_info(path: &Path) -> Option<VolumeInfo> {
+    let c = c_path(path).ok()?;
+    // SAFETY: `statfs` is plain data; zero is a valid bit pattern for it.
+    let mut info: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is a valid C string and `info` is a valid out pointer.
+    if unsafe { libc::statfs(c.as_ptr(), &mut info) } != 0 {
+        return None;
+    }
+    let free = info.f_bavail.saturating_mul(u64::from(info.f_bsize));
+    // SAFETY: `f_mntonname` is a NUL-terminated C string inside `info`.
+    let mount = unsafe { std::ffi::CStr::from_ptr(info.f_mntonname.as_ptr()) };
+    let mut mount = PathBuf::from(std::ffi::OsStr::from_bytes(mount.to_bytes()));
+    // The boot volume group: the data volume is the same tree as `/`.
+    if mount == Path::new("/System/Volumes/Data") {
+        mount = PathBuf::from("/");
+    }
+    let name = volume_name(&mount).unwrap_or_else(|| {
+        mount
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "/".to_string())
+    });
+    Some(VolumeInfo { mount, name, free })
+}
+
+fn volume_name(mount: &Path) -> Option<String> {
+    use objc2_foundation::{NSArray, NSString, NSURL, NSURLVolumeLocalizedNameKey};
+    let url = NSURL::from_directory_path(mount)?;
+    // SAFETY: The resource key is an immutable static from Foundation.
+    let key = unsafe { NSURLVolumeLocalizedNameKey };
+    let keys = NSArray::from_slice(&[key]);
+    let values = url.resourceValuesForKeys_error(&keys).ok()?;
+    let name = values.objectForKey(key)?.downcast::<NSString>().ok()?;
+    Some(name.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,6 +184,14 @@ mod tests {
         assert!(!create_new_file(&path, b"template").expect("exists"));
         assert_eq!(std::fs::read_to_string(&path).expect("read"), "user text");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn volume_of_the_home_folder() {
+        let info = volume_info(&std::env::temp_dir()).expect("volume info");
+        assert_eq!(info.mount, PathBuf::from("/"));
+        assert!(!info.name.is_empty());
+        assert!(info.free > 0);
     }
 
     #[test]

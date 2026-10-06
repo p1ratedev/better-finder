@@ -185,7 +185,7 @@ fn draw(s: &AppState, bounds: NSRect) {
     let Some(model) = &s.help else { return };
     let st = &s.style;
     // Dim the list under the overlay.
-    theme::color_alpha(st.theme.background, 0.85).setFill();
+    st.colors.list_bg.colorWithAlphaComponent(0.85).setFill();
     NSBezierPath::fillRect(bounds);
 
     let panel_w = (bounds.size.width - 2.0 * MARGIN).clamp(0.0, MAX_WIDTH);
@@ -195,9 +195,9 @@ fn draw(s: &AppState, bounds: NSRect) {
         NSSize::new(panel_w - 1.0, model.panel_height(st) - 1.0),
     );
     let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(panel, 10.0, 10.0);
-    st.panel_bg.setFill();
+    st.colors.panel_bg.setFill();
     path.fill();
-    st.border.setStroke();
+    st.colors.separator.setStroke();
     path.stroke();
 
     let h = st.row_height;

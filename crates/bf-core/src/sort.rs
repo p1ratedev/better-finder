@@ -12,6 +12,8 @@ pub enum SortKey {
     Name,
     Size,
     Modified,
+    /// The birth time. Newest first, like `Modified`.
+    Created,
     Extension,
 }
 
@@ -43,9 +45,10 @@ impl FromStr for SortKey {
             "name" => Ok(Self::Name),
             "size" => Ok(Self::Size),
             "modified" => Ok(Self::Modified),
+            "created" => Ok(Self::Created),
             "extension" => Ok(Self::Extension),
             _ => Err(format!(
-                "unknown sort key: {s} (use name, size, modified, or extension)"
+                "unknown sort key: {s} (use name, size, modified, created, or extension)"
             )),
         }
     }
@@ -57,6 +60,7 @@ impl fmt::Display for SortKey {
             Self::Name => "name",
             Self::Size => "size",
             Self::Modified => "modified",
+            Self::Created => "created",
             Self::Extension => "extension",
         })
     }
@@ -121,6 +125,7 @@ fn cmp_lower(a: char, b: char) -> Ordering {
 /// - `Name`: `natural_cmp` on the name.
 /// - `Size`: smallest first. Directories have no size; they sort by name.
 /// - `Modified`: newest first. Unknown time goes last.
+/// - `Created`: like `Modified`, with the birth time.
 /// - `Extension`: `natural_cmp` on the extension, then on the name.
 ///
 /// Ties always fall back to `natural_cmp` on the name. `reverse` flips the
@@ -141,13 +146,22 @@ pub fn sort_entries(entries: &mut [Entry], opts: SortOptions) {
                 let size = |e: &Entry| if e.is_dir { 0 } else { e.size };
                 flip(size(a).cmp(&size(b))).then_with(|| by_name(a, b))
             }
-            SortKey::Modified => match (a.modified, b.modified) {
-                // Unknown time goes last in both directions.
-                (None, None) => by_name(a, b),
-                (None, Some(_)) => Ordering::Greater,
-                (Some(_), None) => Ordering::Less,
-                (Some(x), Some(y)) => flip(y.cmp(&x)).then_with(|| by_name(a, b)),
-            },
+            SortKey::Modified | SortKey::Created => {
+                let time = |e: &Entry| {
+                    if key == SortKey::Modified {
+                        e.modified
+                    } else {
+                        e.created
+                    }
+                };
+                match (time(a), time(b)) {
+                    // Unknown time goes last in both directions.
+                    (None, None) => by_name(a, b),
+                    (None, Some(_)) => Ordering::Greater,
+                    (Some(_), None) => Ordering::Less,
+                    (Some(x), Some(y)) => flip(y.cmp(&x)).then_with(|| by_name(a, b)),
+                }
+            }
             SortKey::Extension => {
                 flip(natural_cmp(a.extension(), b.extension())).then_with(|| by_name(a, b))
             }
@@ -180,6 +194,7 @@ mod tests {
             is_package: false,
             size,
             modified: secs.map(|s| SystemTime::UNIX_EPOCH + Duration::from_secs(s)),
+            created: secs.map(|s| SystemTime::UNIX_EPOCH + Duration::from_secs(1000 - s)),
             hidden: false,
             executable: false,
         }
@@ -234,6 +249,7 @@ mod tests {
             SortKey::Name,
             SortKey::Size,
             SortKey::Modified,
+            SortKey::Created,
             SortKey::Extension,
         ] {
             assert_eq!(k.to_string().parse::<SortKey>().unwrap(), k);
@@ -291,6 +307,16 @@ mod tests {
         assert_eq!(names(&e), ["adir", "a.rs", "b.txt", "Zdir", "c.md"]);
         sort_entries(&mut e, opts(SortKey::Modified, true, false));
         assert_eq!(names(&e), ["Zdir", "b.txt", "a.rs", "adir", "c.md"]);
+    }
+
+    #[test]
+    fn sort_by_created_none_last() {
+        // `entry` sets the birth time to 1000 - the modified time.
+        let mut e = sample();
+        sort_entries(&mut e, opts(SortKey::Created, false, false));
+        assert_eq!(names(&e), ["Zdir", "b.txt", "a.rs", "adir", "c.md"]);
+        sort_entries(&mut e, opts(SortKey::Created, true, false));
+        assert_eq!(names(&e), ["adir", "a.rs", "b.txt", "Zdir", "c.md"]);
     }
 
     #[test]

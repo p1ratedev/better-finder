@@ -238,6 +238,16 @@ impl Pane {
         Some(request)
     }
 
+    /// True when `back` has a directory to go to.
+    pub fn can_go_back(&self) -> bool {
+        !self.back.is_empty()
+    }
+
+    /// True when `forward` has a directory to go to.
+    pub fn can_go_forward(&self) -> bool {
+        !self.forward.is_empty()
+    }
+
     /// `None` when the back stack is empty.
     pub fn back(&mut self) -> Option<LoadRequest> {
         let path = self.back.last()?.clone();
@@ -450,6 +460,7 @@ mod tests {
             is_package: false,
             size: 1,
             modified: None,
+            created: None,
             hidden: name.starts_with('.'),
             executable: false,
         }
@@ -527,6 +538,7 @@ mod tests {
         let req = pane.navigate_to("/a/x".into());
         load(&mut pane, &req, &["y"]);
         assert_eq!(pane.cwd(), Path::new("/a/x"));
+        assert!(pane.can_go_back() && !pane.can_go_forward());
 
         let req = pane.back().unwrap();
         assert_eq!(
@@ -537,6 +549,7 @@ mod tests {
         assert_eq!(pane.back.len(), 1);
         load(&mut pane, &req, &["x/"]);
         assert_eq!(pane.cwd(), Path::new("/a"));
+        assert!(!pane.can_go_back() && pane.can_go_forward());
         assert!(pane.back().is_none());
 
         let req = pane.forward().unwrap();

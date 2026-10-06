@@ -39,23 +39,30 @@ use crate::sort::SortOptions;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ThemeMode {
-    /// Follow the macOS appearance (light or dark).
+    /// The macOS semantic colors, like Finder. They follow the appearance
+    /// and the accent color. `resolved_theme` gives the custom light or dark
+    /// palette as a fallback; the app draws with the system colors.
     #[default]
+    System,
+    /// The custom palette that follows the macOS appearance (light or dark).
     Auto,
     Light,
     Dark,
 }
 
-/// Text forms: `auto`, `light`, `dark`.
+/// Text forms: `system`, `auto`, `light`, `dark`.
 impl FromStr for ThemeMode {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
+            "system" => Ok(Self::System),
             "auto" => Ok(Self::Auto),
             "light" => Ok(Self::Light),
             "dark" => Ok(Self::Dark),
-            _ => Err(format!("unknown theme: {s} (use auto, light, dark)")),
+            _ => Err(format!(
+                "unknown theme: {s} (use system, auto, light, dark)"
+            )),
         }
     }
 }
@@ -63,6 +70,7 @@ impl FromStr for ThemeMode {
 impl fmt::Display for ThemeMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::System => "system",
             Self::Auto => "auto",
             Self::Light => "light",
             Self::Dark => "dark",
@@ -111,21 +119,27 @@ impl fmt::Display for TitlebarStyle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Column {
     Size,
+    /// The kind of the item, for example `PDF Document` or `Folder`.
+    Kind,
     Modified,
+    /// The birth time.
+    Created,
     Extension,
 }
 
-/// Text forms: `size`, `modified`, `extension`.
+/// Text forms: `size`, `kind`, `modified`, `created`, `extension`.
 impl FromStr for Column {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
             "size" => Ok(Self::Size),
+            "kind" => Ok(Self::Kind),
             "modified" => Ok(Self::Modified),
+            "created" => Ok(Self::Created),
             "extension" => Ok(Self::Extension),
             _ => Err(format!(
-                "unknown column: {s} (use size, modified, extension)"
+                "unknown column: {s} (use size, kind, modified, created, extension)"
             )),
         }
     }
@@ -135,7 +149,9 @@ impl fmt::Display for Column {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Size => "size",
+            Self::Kind => "kind",
             Self::Modified => "modified",
+            Self::Created => "created",
             Self::Extension => "extension",
         })
     }
@@ -222,9 +238,10 @@ pub struct Config {
     pub font_family: Option<String>,
     /// `font-size`, in points. Default: `13`. Valid: 6 to 72.
     pub font_size: f64,
-    /// `row-height`, in points. Default: none (`font_size * 1.7`, rounded).
+    /// `row-height`, in points. Default: none (`font_size * 1.55`, rounded).
+    /// The default gives 20 pt for 13 pt text, like Finder.
     pub row_height: Option<f64>,
-    /// `theme`. Default: `auto`.
+    /// `theme`. Default: `system`.
     pub theme: ThemeMode,
     /// The color keys: `background`, `foreground`, `selection-background`,
     /// `selection-foreground`, `directory-color`, `symlink-color`,
@@ -245,10 +262,10 @@ pub struct Config {
     /// `sort-by` (default `name`), `sort-reverse` (default `false`),
     /// `directories-first` (default `true`).
     pub sort: SortOptions,
-    /// `columns`, a comma-separated list. Default: `size,modified`.
+    /// `columns`, a comma-separated list. Default: `size,kind,modified`.
     /// The value `none` shows only names. (An empty value resets to the default.)
     pub columns: Vec<Column>,
-    /// `date-format`. Default: `%Y-%m-%d %H:%M`. See `format::format_time`.
+    /// `date-format`. Default: `finder`. See `format::format_time`.
     pub date_format: String,
     /// `filter-mode`. Default: `substring`.
     pub filter_mode: FilterMode,
@@ -261,15 +278,50 @@ pub struct Config {
     pub auto_refresh: bool,
     /// `keybind`, repeatable. Default: `Keymap::default()`.
     pub keymap: Keymap,
+    /// `sidebar`: show the sidebar at start. Default: `true`.
+    pub sidebar: bool,
+    /// `sidebar-width`, in points. Default: `180`. Valid: 120 to 400.
+    pub sidebar_width: f64,
+    /// `sidebar-item`, repeatable: one folder in the Favorites group. A new
+    /// path goes after the others. `clear` removes all items, the defaults
+    /// too. An empty value gives the defaults again. Default:
+    /// `/Applications`, `~/Desktop`, `~/Documents`, `~/Downloads`, `~`.
+    pub sidebar_items: Vec<PathBuf>,
+    /// `sidebar-locations`: show the Locations group. Default: `true`.
+    pub sidebar_locations: bool,
+    /// `toolbar`: the toolbar with back, forward, the title, and the filter
+    /// field. Default: `true`.
+    pub toolbar: bool,
+    /// `column-header`: the column titles above the list. Default: `true`.
+    pub column_header: bool,
+    /// `path-bar`: the path above the status text. Default: `true`.
+    pub path_bar: bool,
 }
 
 const DEFAULT_FONT_SIZE: f64 = 13.0;
 const DEFAULT_OPACITY: f64 = 1.0;
 const DEFAULT_WINDOW_WIDTH: f64 = 1000.0;
 const DEFAULT_WINDOW_HEIGHT: f64 = 650.0;
-const DEFAULT_DATE_FORMAT: &str = "%Y-%m-%d %H:%M";
+const DEFAULT_DATE_FORMAT: &str = "finder";
 const DEFAULT_TERMINAL: &str = "Terminal";
-const DEFAULT_COLUMNS: [Column; 2] = [Column::Size, Column::Modified];
+const DEFAULT_COLUMNS: [Column; 3] = [Column::Size, Column::Kind, Column::Modified];
+const DEFAULT_SIDEBAR_WIDTH: f64 = 180.0;
+/// The default Favorites, like Finder.
+const DEFAULT_SIDEBAR_ITEMS: [&str; 5] = [
+    "/Applications",
+    "~/Desktop",
+    "~/Documents",
+    "~/Downloads",
+    "~",
+];
+
+fn default_sidebar_items() -> Vec<PathBuf> {
+    let home = crate::fs::home_dir();
+    DEFAULT_SIDEBAR_ITEMS
+        .iter()
+        .map(|item| crate::fs::expand_path(item, &home))
+        .collect()
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -293,6 +345,13 @@ impl Default for Config {
             terminal: DEFAULT_TERMINAL.to_string(),
             auto_refresh: true,
             keymap: Keymap::default(),
+            sidebar: true,
+            sidebar_width: DEFAULT_SIDEBAR_WIDTH,
+            sidebar_items: default_sidebar_items(),
+            sidebar_locations: true,
+            toolbar: true,
+            column_header: true,
+            path_bar: true,
         }
     }
 }
@@ -373,10 +432,11 @@ impl Config {
 
     /// The theme for the current appearance. `system_is_dark` is the macOS
     /// appearance; `theme = light` or `theme = dark` ignores it. The user
-    /// color overrides apply on top.
+    /// color overrides apply on top. For `theme = system`, this is the
+    /// fallback palette; the app uses the macOS semantic colors.
     pub fn resolved_theme(&self, system_is_dark: bool) -> Theme {
         let dark = match self.theme {
-            ThemeMode::Auto => system_is_dark,
+            ThemeMode::System | ThemeMode::Auto => system_is_dark,
             ThemeMode::Light => false,
             ThemeMode::Dark => true,
         };
@@ -402,10 +462,10 @@ impl Config {
         }
     }
 
-    /// `row_height`, or the value from `font_size`.
+    /// `row_height`, or `round(font_size * 1.55)`: 20 pt for 13 pt text.
     pub fn effective_row_height(&self) -> f64 {
         self.row_height
-            .unwrap_or_else(|| (self.font_size * 1.7).round())
+            .unwrap_or_else(|| (self.font_size * 1.55).round())
     }
 
     /// Applies each line of `src`. Returns the `config-file` lines; the
@@ -564,6 +624,32 @@ impl Config {
                     value.to_string()
                 }
             }
+            "sidebar" => self.sidebar = if empty { true } else { boolean(key, value)? },
+            "sidebar-width" => {
+                self.sidebar_width = if empty {
+                    DEFAULT_SIDEBAR_WIDTH
+                } else {
+                    number(key, value, 120.0, 400.0)?
+                }
+            }
+            "sidebar-item" => {
+                if empty {
+                    self.sidebar_items = default_sidebar_items();
+                } else if value == "clear" {
+                    self.sidebar_items.clear();
+                } else {
+                    let path = crate::fs::expand_path(value, &crate::fs::home_dir());
+                    if !self.sidebar_items.contains(&path) {
+                        self.sidebar_items.push(path);
+                    }
+                }
+            }
+            "sidebar-locations" => {
+                self.sidebar_locations = if empty { true } else { boolean(key, value)? }
+            }
+            "toolbar" => self.toolbar = if empty { true } else { boolean(key, value)? },
+            "column-header" => self.column_header = if empty { true } else { boolean(key, value)? },
+            "path-bar" => self.path_bar = if empty { true } else { boolean(key, value)? },
             "keybind" => {
                 if value == "clear" {
                     self.keymap.clear();
@@ -717,10 +803,12 @@ fn parse_columns(value: &str) -> Result<Vec<Column>, String> {
         .collect()
 }
 
-/// A `strftime` pattern that chrono accepts, or the word `relative`.
+/// A `strftime` pattern that chrono accepts, or the word `finder` or `relative`.
 fn valid_date_format(pattern: &str) -> bool {
     use chrono::format::{Item, StrftimeItems};
-    pattern == "relative" || !StrftimeItems::new(pattern).any(|item| matches!(item, Item::Error))
+    pattern == "finder"
+        || pattern == "relative"
+        || !StrftimeItems::new(pattern).any(|item| matches!(item, Item::Error))
 }
 
 /// The config keys that have a line in the template, with the default
@@ -758,7 +846,7 @@ const TEMPLATE_SECTIONS: &[(&str, &[TemplateKey])] = &[
                 "",
                 &[
                     "The row height in points. Valid values: 12 to 200.",
-                    "Empty means the font size times 1.7, rounded.",
+                    "Empty means the font size times 1.55, rounded (20 for 13 pt, like Finder).",
                 ],
             ),
         ],
@@ -768,17 +856,18 @@ const TEMPLATE_SECTIONS: &[(&str, &[TemplateKey])] = &[
         &[
             tk(
                 "theme",
-                "auto",
+                "system",
                 &[
-                    "The color theme: auto, light, or dark.",
-                    "Auto follows the macOS appearance.",
+                    "The color theme: system, auto, light, or dark.",
+                    "System uses the macOS colors and the accent color, like Finder.",
+                    "Auto, light, and dark use the custom palette. Auto follows the macOS appearance.",
                 ],
             ),
             tk(
                 "background",
                 "",
                 &[
-                    "Color keys change the light theme and the dark theme.",
+                    "Color keys change all themes, the system theme too.",
                     "Forms: #rgb, #rrggbb, #rrggbbaa. Empty means the theme color.",
                     "Example value: #1e1e2e",
                 ],
@@ -859,24 +948,26 @@ const TEMPLATE_SECTIONS: &[(&str, &[TemplateKey])] = &[
             ),
             tk(
                 "columns",
-                "size,modified",
+                "size,kind,modified",
                 &[
-                    "The columns after the name: size, modified, extension.",
+                    "The columns after the name: size, kind, modified, created, extension.",
                     "The word none shows only names.",
                 ],
             ),
             tk(
                 "date-format",
-                "%Y-%m-%d %H:%M",
+                "finder",
                 &[
-                    "The date format. Use a strftime pattern.",
+                    "The date format. The word finder uses the macOS format of the system locale,",
+                    "for example Today at 14:32 or 28 Sep 2026 at 13:02.",
                     "The word relative shows Today, Yesterday, and then the date.",
+                    "Other values are strftime patterns, for example %Y-%m-%d %H:%M.",
                 ],
             ),
             tk(
                 "sort-by",
                 "name",
-                &["The sort key: name, size, modified, or extension."],
+                &["The sort key: name, size, modified, created, or extension."],
             ),
             tk(
                 "sort-reverse",
@@ -923,6 +1014,53 @@ const TEMPLATE_SECTIONS: &[(&str, &[TemplateKey])] = &[
                 "auto-refresh",
                 "true",
                 &["Read the folder again when it changes on disk: true or false."],
+            ),
+        ],
+    ),
+    (
+        "Sidebar and bars",
+        &[
+            tk(
+                "sidebar",
+                "true",
+                &[
+                    "Show the sidebar at start: true or false.",
+                    "The toggle_sidebar action shows or hides it.",
+                ],
+            ),
+            tk(
+                "sidebar-width",
+                "180",
+                &["The sidebar width in points. Valid values: 120 to 400."],
+            ),
+            tk(
+                "sidebar-item",
+                "",
+                &[
+                    "One folder in the Favorites group. Use the key one time for each folder.",
+                    "The value clear removes all items, the defaults too. Empty means the defaults:",
+                    "/Applications, ~/Desktop, ~/Documents, ~/Downloads, and ~.",
+                ],
+            ),
+            tk(
+                "sidebar-locations",
+                "true",
+                &["Show iCloud Drive, the volumes, and the Trash: true or false."],
+            ),
+            tk(
+                "toolbar",
+                "true",
+                &["Show the toolbar with back, forward, the title, and the filter field."],
+            ),
+            tk(
+                "column-header",
+                "true",
+                &["Show the column titles. A click on a title sorts the list."],
+            ),
+            tk(
+                "path-bar",
+                "true",
+                &["Show the path of the folder at the bottom: true or false."],
             ),
         ],
     ),
@@ -1015,8 +1153,12 @@ mod tests {
     fn defaults() {
         let c = Config::default();
         assert_eq!(c.font_size, 13.0);
-        assert_eq!(c.columns, [Column::Size, Column::Modified]);
-        assert_eq!(c.effective_row_height(), 22.0);
+        assert_eq!(c.columns, [Column::Size, Column::Kind, Column::Modified]);
+        assert_eq!(c.effective_row_height(), 20.0);
+        assert_eq!(c.theme, ThemeMode::System);
+        assert_eq!(c.date_format, "finder");
+        assert!(c.sidebar && c.sidebar_locations && c.toolbar && c.column_header && c.path_bar);
+        assert_eq!(c.sidebar_width, 180.0);
         assert_eq!(clean(""), c);
     }
 
@@ -1077,10 +1219,10 @@ mod tests {
         assert_eq!(c.window_height, 700.0);
         assert_eq!(c.row_height, None);
         assert!(!c.show_hidden);
-        assert_eq!(c.theme, ThemeMode::Auto);
+        assert_eq!(c.theme, ThemeMode::System);
         assert_eq!(c.colors.background, None);
-        assert_eq!(c.columns, [Column::Size, Column::Modified]);
-        assert_eq!(c.date_format, "%Y-%m-%d %H:%M");
+        assert_eq!(c.columns, [Column::Size, Column::Kind, Column::Modified]);
+        assert_eq!(c.date_format, "finder");
         assert_eq!(diags[0].line, 2);
         assert_eq!(diags[1].line, 3);
     }
@@ -1120,6 +1262,14 @@ mod tests {
             clean("columns = extension, size").columns,
             [Column::Extension, Column::Size]
         );
+        assert_eq!(
+            clean("columns = kind,created").columns,
+            [Column::Kind, Column::Created]
+        );
+        assert_eq!(
+            clean("sort-by = created").sort.key,
+            crate::sort::SortKey::Created
+        );
         assert!(clean("columns = none").columns.is_empty());
         assert_eq!(parse("columns = size,,modified").1.len(), 1);
         let c = clean("sort-by = size\nsort-reverse = true\ndirectories-first = false\n");
@@ -1135,6 +1285,7 @@ mod tests {
 
     #[test]
     fn date_formats() {
+        assert_eq!(clean("date-format = finder").date_format, "finder");
         assert_eq!(clean("date-format = relative").date_format, "relative");
         assert_eq!(clean("date-format = %d/%m/%y").date_format, "%d/%m/%y");
         assert_eq!(parse("date-format = %").1.len(), 1);
@@ -1194,8 +1345,15 @@ mod tests {
     #[test]
     fn theme_resolution() {
         let mut c = Config::default();
+        // `system` is the default. Its fallback palette follows the appearance.
+        assert_eq!(c.theme, ThemeMode::System);
         assert_eq!(c.resolved_theme(true), Theme::default_dark());
         assert_eq!(c.resolved_theme(false), Theme::default_light());
+        c.theme = ThemeMode::Auto;
+        assert_eq!(c.resolved_theme(true), Theme::default_dark());
+        assert_eq!(c.resolved_theme(false), Theme::default_light());
+        assert_eq!(clean("theme = system").theme, ThemeMode::System);
+        assert_eq!(clean("theme = auto").theme, ThemeMode::Auto);
         c.theme = ThemeMode::Light;
         assert_eq!(c.resolved_theme(true), Theme::default_light());
         c.theme = ThemeMode::Dark;
@@ -1214,9 +1372,40 @@ mod tests {
             font_size: 14.0,
             ..Config::default()
         };
-        assert_eq!(c.effective_row_height(), 24.0);
+        // round(14 * 1.55) = round(21.7) = 22.
+        assert_eq!(c.effective_row_height(), 22.0);
+        c.font_size = 13.0;
+        assert_eq!(c.effective_row_height(), 20.0);
+        c.font_size = 16.0;
+        assert_eq!(c.effective_row_height(), 25.0);
         c.row_height = Some(30.0);
         assert_eq!(c.effective_row_height(), 30.0);
+    }
+
+    #[test]
+    fn sidebar_and_bar_keys() {
+        let home = crate::fs::home_dir();
+        let c = clean(
+            "sidebar = false\nsidebar-width = 250\nsidebar-locations = false\ntoolbar = false\ncolumn-header = false\npath-bar = false\n",
+        );
+        assert!(
+            !c.sidebar && !c.sidebar_locations && !c.toolbar && !c.column_header && !c.path_bar
+        );
+        assert_eq!(c.sidebar_width, 250.0);
+        assert_eq!(parse("sidebar-width = 100").1.len(), 1);
+        assert_eq!(parse("sidebar-width = 401").1.len(), 1);
+        assert_eq!(parse("toolbar = yes").1.len(), 1);
+
+        let c = clean("sidebar-item = ~/Projects\nsidebar-item = ~/Projects\n");
+        assert_eq!(c.sidebar_items.len(), 6);
+        assert_eq!(c.sidebar_items[0], PathBuf::from("/Applications"));
+        assert_eq!(c.sidebar_items[4], home);
+        assert_eq!(c.sidebar_items[5], home.join("Projects"));
+
+        let c = clean("sidebar-item = clear\nsidebar-item = /tmp\n");
+        assert_eq!(c.sidebar_items, [PathBuf::from("/tmp")]);
+        let c = clean("sidebar-item = clear\nsidebar-item =\n");
+        assert_eq!(c.sidebar_items, Config::default().sidebar_items);
     }
 
     #[test]
@@ -1267,7 +1456,12 @@ mod tests {
 
     #[test]
     fn enum_text_round_trips() {
-        for t in [ThemeMode::Auto, ThemeMode::Light, ThemeMode::Dark] {
+        for t in [
+            ThemeMode::System,
+            ThemeMode::Auto,
+            ThemeMode::Light,
+            ThemeMode::Dark,
+        ] {
             assert_eq!(t.to_string().parse::<ThemeMode>().unwrap(), t);
         }
         for t in [
@@ -1277,7 +1471,13 @@ mod tests {
         ] {
             assert_eq!(t.to_string().parse::<TitlebarStyle>().unwrap(), t);
         }
-        for t in [Column::Size, Column::Modified, Column::Extension] {
+        for t in [
+            Column::Size,
+            Column::Kind,
+            Column::Modified,
+            Column::Created,
+            Column::Extension,
+        ] {
             assert_eq!(t.to_string().parse::<Column>().unwrap(), t);
         }
         assert!("x".parse::<ThemeMode>().is_err());
@@ -1484,6 +1684,13 @@ mod tests {
             "start-directory",
             "terminal",
             "auto-refresh",
+            "sidebar",
+            "sidebar-width",
+            "sidebar-item",
+            "sidebar-locations",
+            "toolbar",
+            "column-header",
+            "path-bar",
         ];
         for key in expected {
             assert!(keys.contains(&key), "missing {key}");

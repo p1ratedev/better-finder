@@ -1,17 +1,19 @@
 //! The file list: a custom `NSView` inside an `NSScrollView`.
 //!
-//! - It draws only the rows in the dirty rect.
+//! - It draws only the rows in the dirty rect, with the Finder metrics.
+//! - The scroll view draws the background. The list content scrolls under
+//!   the toolbar and the column header: `inset_top` is the height that they
+//!   cover, and the scroll code keeps the cursor below it.
 //! - It converts key events to `bf_core::KeyEvent` and sends them to the keymap.
 //! - It handles the mouse.
 //! - It is the controller of the Quick Look panel (it is in the responder chain).
+//! - It hosts the inline rename field.
 
 use std::cell::Cell;
 use std::time::{Instant, SystemTime};
 
-use bf_core::config::Column;
-use bf_core::format::{format_time, human_size};
 use bf_core::keymap::{Key, Mods, NamedKey};
-use bf_core::{Entry, EntryKind, KeyEvent};
+use bf_core::{Entry, KeyEvent};
 use objc2::rc::Retained;
 use objc2::{ClassType, DefinedClass, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
@@ -22,14 +24,19 @@ use objc2_foundation::{MainThreadMarker, NSObject, NSPoint, NSRect, NSSize, NSSt
 use objc2_quick_look_ui::QLPreviewPanel;
 
 use crate::app::{self, AppState};
+use crate::columns;
 use crate::debug::trace;
 use crate::icons;
 use crate::quicklook;
-use crate::theme::{Attrs, COLUMN_GAP, ColumnSpec, LEFT_PAD, RIGHT_PAD, Style};
+use crate::theme::{
+    Attrs, ColumnLayout, LEFT_PAD, RowState, SELECTION_INSET, SELECTION_RADIUS, Style,
+};
 
 pub struct ListIvars {
     row_height: Cell<f64>,
     rows: Cell<usize>,
+    /// The height at the top that the toolbar and the column header cover.
+    inset_top: Cell<f64>,
 }
 
 thread_local! {
@@ -62,6 +69,14 @@ define_class!(
             // AppKit is in the middle of a first responder change. Run the
             // app logic later, not inside this call.
             app::after_now(app::list_did_focus);
+            // The cursor row changes from the inactive to the active color.
+            self.setNeedsDisplay(true);
+            true
+        }
+
+        #[unsafe(method(resignFirstResponder))]
+        fn resign_first_responder(&self) -> bool {
+            self.setNeedsDisplay(true);
             true
         }
 
@@ -92,6 +107,14 @@ define_class!(
             }
         }
 
+        #[unsafe(method(scrollWheel:))]
+        fn scroll_wheel(&self, event: &NSEvent) {
+            // A scroll cancels the inline rename, like in Finder.
+            app::after_now(app::cancel_inline_rename);
+            // SAFETY: NSResponder implements this method with this signature.
+            let _: () = unsafe { msg_send![super(self), scrollWheel: event] };
+        }
+
         #[unsafe(method(resizeWithOldSuperviewSize:))]
         fn resize_with_old_superview_size(&self, old: NSSize) {
             // SAFETY: NSView implements this method with this signature.
@@ -119,8 +142,9 @@ define_class!(
 impl ListView {
     pub fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(ListIvars {
-            row_height: Cell::new(22.0),
+            row_height: Cell::new(20.0),
             rows: Cell::new(0),
+            inset_top: Cell::new(0.0),
         });
         // SAFETY: `initWithFrame:` is the designated initializer of NSView.
         unsafe { msg_send![super(this), initWithFrame: frame] }
@@ -137,8 +161,16 @@ impl ListView {
         self.update_frame();
     }
 
-    /// Height = rows x row height, but at least the height of the clip view.
-    /// Width = the width of the clip view.
+    /// Sets the height at the top that other views cover.
+    pub fn set_inset_top(&self, inset: f64) {
+        if self.ivars().inset_top.replace(inset) != inset {
+            self.update_frame();
+            self.setNeedsDisplay(true);
+        }
+    }
+
+    /// Height = rows x row height, but at least the free height of the clip
+    /// view. Width = the width of the clip view.
     pub fn update_frame(&self) {
         // SAFETY: The superview is the clip view, which retains this view.
         let Some(clip) = (unsafe { self.superview() }) else {
@@ -147,7 +179,8 @@ impl ListView {
         let clip_size = clip.bounds().size;
         let iv = self.ivars();
         let content = iv.rows.get() as f64 * iv.row_height.get();
-        let size = NSSize::new(clip_size.width, content.max(clip_size.height));
+        let free = (clip_size.height - iv.inset_top.get()).max(0.0);
+        let size = NSSize::new(clip_size.width, content.max(free));
         let current = self.frame().size;
         if current.width != size.width || current.height != size.height {
             self.setFrameSize(size);
@@ -162,26 +195,54 @@ impl ListView {
         )
     }
 
-    /// Scrolls so that `row` is visible with a margin of 2 rows.
-    pub fn scroll_to_row(&self, row: usize) {
-        let iv = self.ivars();
-        let (rows, h) = (iv.rows.get(), iv.row_height.get());
-        if rows == 0 {
-            self.scrollRectToVisible(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1.0, 1.0)));
-            return;
-        }
-        let row = row.min(rows - 1);
-        let visible = self.visibleRect().size.height;
-        let (first, last) = if visible >= 5.0 * h {
-            (row.saturating_sub(2), (row + 3).min(rows))
-        } else {
-            (row, row + 1)
+    /// The part of the visible rect that the toolbar and the header do not
+    /// cover. The clip view bounds use the document coordinates; at the top
+    /// of the scroll range, their origin is `-inset_top`.
+    fn free_rect(&self) -> NSRect {
+        let visible = self.visibleRect();
+        let Some(scroll) = self.enclosingScrollView() else {
+            return visible;
         };
-        let rect = NSRect::new(
-            NSPoint::new(0.0, first as f64 * h),
-            NSSize::new(1.0, (last - first) as f64 * h),
-        );
-        self.scrollRectToVisible(rect);
+        let clip = scroll.contentView().bounds();
+        let top = (clip.origin.y + self.ivars().inset_top.get()).max(visible.origin.y);
+        let bottom = visible.origin.y + visible.size.height;
+        NSRect::new(
+            NSPoint::new(visible.origin.x, top),
+            NSSize::new(visible.size.width, (bottom - top).max(0.0)),
+        )
+    }
+
+    /// Scrolls so that `row` is visible below the covered top, with a
+    /// margin of 2 rows.
+    pub fn scroll_to_row(&self, row: usize) {
+        let Some(scroll) = self.enclosingScrollView() else {
+            return;
+        };
+        let clip = scroll.contentView();
+        let bounds = clip.bounds();
+        let iv = self.ivars();
+        let (rows, h, inset) = (iv.rows.get(), iv.row_height.get(), iv.inset_top.get());
+        let free_height = bounds.size.height - inset;
+        let mut y = bounds.origin.y;
+        if rows == 0 {
+            y = -inset;
+        } else {
+            let row = row.min(rows - 1) as f64;
+            let margin = if free_height >= 5.0 * h { 2.0 * h } else { 0.0 };
+            let top = row * h - margin;
+            let bottom = (row + 1.0) * h + margin;
+            if top < bounds.origin.y + inset {
+                y = top - inset;
+            } else if bottom > bounds.origin.y + bounds.size.height {
+                y = bottom - bounds.size.height;
+            }
+        }
+        let max_y = (self.frame().size.height - bounds.size.height).max(-inset);
+        let y = y.clamp(-inset, max_y);
+        if y != bounds.origin.y {
+            clip.scrollToPoint(NSPoint::new(bounds.origin.x, y));
+            scroll.reflectScrolledClipView(&clip);
+        }
     }
 
     /// The screen rect of the icon (or of the row, without icons) of `row`.
@@ -196,13 +257,24 @@ impl ListView {
             ),
             None => self.row_rect(row),
         };
-        let visible = self.visibleRect();
+        let visible = self.free_rect();
         let top = rect.origin.y + rect.size.height;
         if top <= visible.origin.y || rect.origin.y >= visible.origin.y + visible.size.height {
             return None;
         }
         let window = self.window()?;
         Some(window.convertRectToScreen(self.convertRect_toView(rect, None)))
+    }
+
+    /// The frame of the inline rename field over the name of `row`.
+    pub fn name_field_frame(&self, row: usize, layout: &ColumnLayout, field_height: f64) -> NSRect {
+        let h = self.ivars().row_height.get();
+        let y = row as f64 * h + ((h - field_height) / 2.0).round();
+        let x = layout.name_x - 3.0;
+        NSRect::new(
+            NSPoint::new(x, y),
+            NSSize::new((layout.name_end - x + 3.0).max(40.0), field_height),
+        )
     }
 
     /// AppKit sends key equivalents to all views in the window. Act only
@@ -218,7 +290,7 @@ impl ListView {
         self.is_first_responder() && handle_ns_key(event)
     }
 
-    fn is_first_responder(&self) -> bool {
+    pub fn is_first_responder(&self) -> bool {
         let Some(window) = self.window() else {
             return false;
         };
@@ -231,11 +303,18 @@ impl ListView {
         )
     }
 
+    /// True when the list has the keyboard focus in the key window. The
+    /// cursor row then uses the active selection color.
+    fn is_active(&self) -> bool {
+        self.window().is_some_and(|w| w.isKeyWindow()) && self.is_first_responder()
+    }
+
     fn draw(&self, dirty: NSRect) {
         let started = Instant::now();
         let bounds = self.bounds();
-        let visible = self.visibleRect();
-        let drawn = app::with_ref(|s| draw_list(s, bounds, visible, dirty)).flatten();
+        let free = self.free_rect();
+        let active = self.is_active();
+        let drawn = app::with_ref(|s| draw_list(s, bounds, free, dirty, active)).flatten();
         let Some(rows) = drawn else { return };
         // The draw put paths in the icon queue. Get their icons after the frame.
         icons::schedule_resolve();
@@ -339,8 +418,14 @@ fn named_key(code: u16) -> Option<NamedKey> {
 }
 
 /// Draws the rows in `dirty`. Returns the number of rows, or `None` before
-/// the first load.
-fn draw_list(s: &AppState, bounds: NSRect, visible: NSRect, dirty: NSRect) -> Option<usize> {
+/// the first load. `free` is the visible part below the covered top.
+fn draw_list(
+    s: &AppState,
+    bounds: NSRect,
+    free: NSRect,
+    dirty: NSRect,
+    active: bool,
+) -> Option<usize> {
     if !s.pane.is_loaded() {
         return None;
     }
@@ -352,10 +437,10 @@ fn draw_list(s: &AppState, bounds: NSRect, visible: NSRect, dirty: NSRect) -> Op
         } else {
             "No matches"
         };
-        let y = (visible.origin.y + (visible.size.height - st.line_height) / 2.0).round();
+        let y = (free.origin.y + (free.size.height - st.line_height) / 2.0).round();
         let rect = NSRect::new(
-            NSPoint::new(visible.origin.x, y),
-            NSSize::new(visible.size.width, st.line_height),
+            NSPoint::new(free.origin.x, y),
+            NSSize::new(free.size.width, st.line_height),
         );
         draw_text(text, rect, &st.empty);
         return Some(0);
@@ -364,12 +449,18 @@ fn draw_list(s: &AppState, bounds: NSRect, visible: NSRect, dirty: NSRect) -> Op
     let first = (dirty.origin.y / h).floor().max(0.0) as usize;
     let end = (((dirty.origin.y + dirty.size.height) / h).ceil().max(0.0) as usize).min(len);
     let width = bounds.size.width;
+    let layout = st.layout(width);
     let frame = RowFrame {
         st,
         width,
-        columns: st.visible_columns(width),
+        layout: &layout,
         now: SystemTime::now(),
         path_icons: s.cwd_is_local(),
+        cursor_state: if active {
+            RowState::Selected
+        } else {
+            RowState::SelectedInactive
+        },
     };
     let cursor = s.pane.cursor();
     for row in first..end {
@@ -385,29 +476,46 @@ fn draw_list(s: &AppState, bounds: NSRect, visible: NSRect, dirty: NSRect) -> Op
 struct RowFrame<'a> {
     st: &'a Style,
     width: f64,
-    columns: &'a [ColumnSpec],
+    layout: &'a ColumnLayout,
     now: SystemTime,
     /// Ask for path-specific icons (only on a local volume).
     path_icons: bool,
+    /// The state of the cursor row.
+    cursor_state: RowState,
 }
 
-fn draw_row(frame: &RowFrame<'_>, entry: &Entry, row: usize, selected: bool) {
+fn draw_row(frame: &RowFrame<'_>, entry: &Entry, row: usize, is_cursor: bool) {
     let RowFrame {
         st,
         width,
-        columns,
+        layout,
         now,
         path_icons,
+        cursor_state,
     } = *frame;
     let h = st.row_height;
     let y = row as f64 * h;
-    if selected {
-        st.selection_bg.setFill();
+    let state = if is_cursor {
+        cursor_state
+    } else {
+        RowState::Normal
+    };
+    if is_cursor {
+        let fill = match state {
+            RowState::Selected => &st.colors.selection_bg,
+            _ => &st.colors.selection_bg_inactive,
+        };
+        fill.setFill();
         let rect = NSRect::new(
-            NSPoint::new(6.0, y + 1.0),
-            NSSize::new((width - 12.0).max(0.0), (h - 2.0).max(0.0)),
+            NSPoint::new(SELECTION_INSET, y),
+            NSSize::new((width - 2.0 * SELECTION_INSET).max(0.0), h),
         );
-        NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(rect, 5.0, 5.0).fill();
+        NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+            rect,
+            SELECTION_RADIUS,
+            SELECTION_RADIUS,
+        )
+        .fill();
     }
     if st.show_icons {
         if let Some(icon) = icons::icon_for(entry, path_icons) {
@@ -416,7 +524,7 @@ fn draw_row(frame: &RowFrame<'_>, entry: &Entry, row: usize, selected: bool) {
                 NSPoint::new(LEFT_PAD, y + ((h - size) / 2.0).round()),
                 NSSize::new(size, size),
             );
-            let alpha = if entry.hidden { 0.55 } else { 1.0 };
+            let alpha = if entry.hidden { 0.5 } else { 1.0 };
             // SAFETY: A `None` hints dictionary is valid. The view is flipped,
             // so `respectFlipped` must be true.
             unsafe {
@@ -431,51 +539,28 @@ fn draw_row(frame: &RowFrame<'_>, entry: &Entry, row: usize, selected: bool) {
             }
         }
     }
+    let attrs = st.row(state);
     let text_y = y + ((h - st.line_height) / 2.0).round();
-    let mut right = width - RIGHT_PAD;
-    for col in columns.iter().rev() {
-        let text = column_text(col.column, entry, &st.date_format, now);
+    for (spec, x) in &layout.columns {
+        let text = columns::cell_text(spec.column, entry, &st.date_format, now);
         let rect = NSRect::new(
-            NSPoint::new(right - col.width, text_y),
-            NSSize::new(col.width, st.line_height),
+            NSPoint::new(*x, text_y),
+            NSSize::new(spec.width, st.line_height),
         );
-        let attrs = if selected {
-            &st.column_selected
+        let column_attrs = if spec.right_aligned {
+            &attrs.right
+        } else if spec.column == bf_core::config::Column::Kind {
+            &attrs.middle
         } else {
-            &st.column
+            &attrs.left
         };
-        draw_text(&text, rect, attrs);
-        right -= col.width + COLUMN_GAP;
+        draw_text(&text, rect, column_attrs);
     }
-    let x = st.name_x();
     let rect = NSRect::new(
-        NSPoint::new(x, text_y),
-        NSSize::new((right - x).max(0.0), st.line_height),
+        NSPoint::new(layout.name_x, text_y),
+        NSSize::new((layout.name_end - layout.name_x).max(0.0), st.line_height),
     );
-    draw_text(&entry.name, rect, st.name.for_entry(entry, selected));
-}
-
-fn column_text(column: Column, entry: &Entry, date_format: &str, now: SystemTime) -> String {
-    match column {
-        Column::Size => {
-            if entry.is_dir || entry.is_package || entry.kind == EntryKind::Directory {
-                "--".to_string()
-            } else {
-                human_size(entry.size)
-            }
-        }
-        Column::Modified => entry
-            .modified
-            .map(|t| format_time(t, date_format, now))
-            .unwrap_or_else(|| "--".to_string()),
-        Column::Extension => {
-            if entry.kind == EntryKind::Directory && !entry.is_package {
-                String::new()
-            } else {
-                entry.extension().to_string()
-            }
-        }
-    }
+    draw_text(&entry.name, rect, attrs.for_entry(entry));
 }
 
 /// Draws one line of text. The paragraph style in `attrs` truncates it.

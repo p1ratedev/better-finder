@@ -17,10 +17,10 @@ use std::path::PathBuf;
 
 use bf_core::{Entry, EntryKind};
 use objc2::rc::Retained;
-use objc2_app_kit::{NSImage, NSWorkspace};
-use objc2_foundation::NSString;
+use objc2_app_kit::{NSColor, NSImage, NSImageSymbolConfiguration, NSWorkspace};
+use objc2_foundation::{NSArray, NSString};
 use objc2_uniform_type_identifiers::{
-    UTType, UTTypeData, UTTypeFolder, UTTypeSymbolicLink, UTTypeUnixExecutable,
+    UTType, UTTypeData, UTTypeFolder, UTTypeSymbolicLink, UTTypeUnixExecutable, UTTypeVolume,
 };
 
 use crate::app;
@@ -33,6 +33,7 @@ struct IconCache {
     by_path: HashMap<PathBuf, Retained<NSImage>>,
     by_extension: HashMap<String, Retained<NSImage>>,
     folder: Option<Retained<NSImage>>,
+    volume: Option<Retained<NSImage>>,
     symlink: Option<Retained<NSImage>>,
     executable: Option<Retained<NSImage>>,
     document: Option<Retained<NSImage>>,
@@ -59,6 +60,49 @@ pub fn icon_for(entry: &Entry, path_icons: bool) -> Option<Retained<NSImage>> {
             .ok()
             .map(|mut c| c.get(entry, path_icons))
     })
+}
+
+/// The generic folder icon (a type icon: no disk access).
+pub fn folder_icon() -> Option<Retained<NSImage>> {
+    CACHE.with(|cache| {
+        let mut c = cache.try_borrow_mut().ok()?;
+        // SAFETY: `UTTypeFolder` is an immutable static.
+        let kind = unsafe { UTTypeFolder };
+        Some(
+            c.folder
+                .get_or_insert_with(|| NSWorkspace::sharedWorkspace().iconForContentType(kind))
+                .clone(),
+        )
+    })
+}
+
+/// The generic volume icon (a type icon: no disk access).
+pub fn volume_icon() -> Option<Retained<NSImage>> {
+    CACHE.with(|cache| {
+        let mut c = cache.try_borrow_mut().ok()?;
+        // SAFETY: `UTTypeVolume` is an immutable static.
+        let kind = unsafe { UTTypeVolume };
+        Some(
+            c.volume
+                .get_or_insert_with(|| NSWorkspace::sharedWorkspace().iconForContentType(kind))
+                .clone(),
+        )
+    })
+}
+
+/// Draws `image` into `rect` (flipped view).
+pub fn draw_in(image: &NSImage, rect: objc2_foundation::NSRect) {
+    // SAFETY: A `None` hints dictionary is valid. The views are flipped.
+    unsafe {
+        image.drawInRect_fromRect_operation_fraction_respectFlipped_hints(
+            rect,
+            objc2_foundation::NSRect::ZERO,
+            objc2_app_kit::NSCompositingOperation::SourceOver,
+            1.0,
+            true,
+            None,
+        );
+    }
 }
 
 /// Clears the path cache. Call it when the directory changes.
@@ -179,5 +223,57 @@ impl IconCache {
                 }
             })
             .clone()
+    }
+}
+
+thread_local! {
+    /// SF Symbol images by (name, point size key, color key).
+    static SYMBOLS: RefCell<HashMap<(String, u32, usize), Retained<NSImage>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// An SF Symbol in one color, at `point_size`. `color` can be a dynamic
+/// system color: it resolves when the image draws. The cache key uses the
+/// address of the color object, so keep the color alive (the `Style` does).
+pub fn symbol(name: &str, point_size: f64, color: &NSColor) -> Option<Retained<NSImage>> {
+    let key = (
+        name.to_string(),
+        (point_size * 10.0) as u32,
+        std::ptr::from_ref(color) as usize,
+    );
+    if let Some(image) = SYMBOLS.with(|s| s.borrow().get(&key).cloned()) {
+        return Some(image);
+    }
+    let base = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+        &NSString::from_str(name),
+        None,
+    )?;
+    // SAFETY: The weight is an immutable static from AppKit.
+    let weight = unsafe { objc2_app_kit::NSFontWeightRegular };
+    let size = NSImageSymbolConfiguration::configurationWithPointSize_weight(point_size, weight);
+    let colors = NSArray::from_slice(&[color]);
+    let palette = NSImageSymbolConfiguration::configurationWithPaletteColors(&colors);
+    let config = size.configurationByApplyingConfiguration(&palette);
+    let image = base.imageWithSymbolConfiguration(&config)?;
+    SYMBOLS.with(|s| s.borrow_mut().insert(key, image.clone()));
+    Some(image)
+}
+
+/// Draws `image` centered in `rect` (flipped view).
+pub fn draw_centered(image: &NSImage, rect: objc2_foundation::NSRect) {
+    let size = image.size();
+    let x = rect.origin.x + ((rect.size.width - size.width) / 2.0).round();
+    let y = rect.origin.y + ((rect.size.height - size.height) / 2.0).round();
+    let target = objc2_foundation::NSRect::new(objc2_foundation::NSPoint::new(x, y), size);
+    // SAFETY: A `None` hints dictionary is valid. The views are flipped.
+    unsafe {
+        image.drawInRect_fromRect_operation_fraction_respectFlipped_hints(
+            target,
+            objc2_foundation::NSRect::ZERO,
+            objc2_app_kit::NSCompositingOperation::SourceOver,
+            1.0,
+            true,
+            None,
+        );
     }
 }

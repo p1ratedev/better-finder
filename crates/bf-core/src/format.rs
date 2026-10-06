@@ -34,6 +34,10 @@ pub fn human_size(bytes: u64) -> String {
 /// Formats `time` in the local time zone.
 ///
 /// - `pattern` is a `strftime` pattern (chrono syntax), for example `%Y-%m-%d %H:%M`.
+/// - The special pattern `finder` gives `Today at 14:32`, `Yesterday at 09:10`,
+///   and `28 Sep 2026 at 13:02` for older dates. The app draws `finder` dates
+///   with the system date formatter (it follows the locale); this text is
+///   the fallback for tests and the CLI.
 /// - The special pattern `relative` gives `Today 14:32`, `Yesterday 09:10`,
 ///   and `%Y-%m-%d` for older dates.
 ///
@@ -41,6 +45,18 @@ pub fn human_size(bytes: u64) -> String {
 pub fn format_time(time: SystemTime, pattern: &str, now: SystemTime) -> String {
     use chrono::{DateTime, Local};
     let time: DateTime<Local> = time.into();
+    if pattern == "finder" {
+        let now: DateTime<Local> = now.into();
+        let day = time.date_naive();
+        let today = now.date_naive();
+        if day == today {
+            return time.format("Today at %H:%M").to_string();
+        }
+        if today.pred_opt() == Some(day) {
+            return time.format("Yesterday at %H:%M").to_string();
+        }
+        return time.format("%-d %b %Y at %H:%M").to_string();
+    }
     if pattern == "relative" {
         let now: DateTime<Local> = now.into();
         let day = time.date_naive();
@@ -127,6 +143,23 @@ mod tests {
         assert_eq!(
             format_time(at(2025, 12, 31, 1, 0), "relative", now),
             "2025-12-31"
+        );
+    }
+
+    #[test]
+    fn finder_dates() {
+        let now = at(2026, 3, 4, 20, 0);
+        assert_eq!(
+            format_time(at(2026, 3, 4, 14, 32), "finder", now),
+            "Today at 14:32"
+        );
+        assert_eq!(
+            format_time(at(2026, 3, 3, 9, 10), "finder", now),
+            "Yesterday at 09:10"
+        );
+        assert_eq!(
+            format_time(at(2025, 9, 28, 13, 2), "finder", now),
+            "28 Sep 2025 at 13:02"
         );
     }
 
