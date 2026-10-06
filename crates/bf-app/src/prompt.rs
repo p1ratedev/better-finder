@@ -1,6 +1,6 @@
 //! The text inputs of the app, with one shared delegate:
 //! - The bottom prompt: one `NSTextField` line above the status bar, with a
-//!   label. It serves "go to folder", and the filter when the toolbar is off.
+//!   label. It is the location and filter field when the toolbar is off.
 //! - The inline rename field over the name of the cursor row.
 //! - The toolbar filter field (it lives in `toolbar`, with this delegate).
 
@@ -215,6 +215,7 @@ pub fn create(mtm: MainThreadMarker, delegate: &Retained<PromptDelegate>) -> Pro
     field.setBordered(false);
     field.setDrawsBackground(false);
     field.setFocusRingType(NSFocusRingType::None);
+    field.setPlaceholderString(Some(&NSString::from_str("Filter or go to a path")));
     let inline = NSTextField::textFieldWithString(&NSString::from_str(""), mtm);
     inline.setBezeled(false);
     inline.setBordered(true);

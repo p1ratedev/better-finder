@@ -296,6 +296,12 @@ pub struct Config {
     pub column_header: bool,
     /// `path-bar`: the path above the status text. Default: `true`.
     pub path_bar: bool,
+    /// `smooth-scroll`: animate the page moves (`half_page_down`,
+    /// `page_down`, `cursor_top`, and the others). Default: `true`.
+    pub smooth_scroll: bool,
+    /// `smooth-scroll-duration`, in milliseconds. Default: `150`. Valid: 0
+    /// to 1000. The value 0 turns the animation off.
+    pub smooth_scroll_duration: u64,
 }
 
 const DEFAULT_FONT_SIZE: f64 = 13.0;
@@ -306,6 +312,7 @@ const DEFAULT_DATE_FORMAT: &str = "finder";
 const DEFAULT_TERMINAL: &str = "Terminal";
 const DEFAULT_COLUMNS: [Column; 3] = [Column::Size, Column::Kind, Column::Modified];
 const DEFAULT_SIDEBAR_WIDTH: f64 = 180.0;
+const DEFAULT_SMOOTH_SCROLL_DURATION: u64 = 150;
 /// The default Favorites, like Finder.
 const DEFAULT_SIDEBAR_ITEMS: [&str; 5] = [
     "/Applications",
@@ -352,6 +359,8 @@ impl Default for Config {
             toolbar: true,
             column_header: true,
             path_bar: true,
+            smooth_scroll: true,
+            smooth_scroll_duration: DEFAULT_SMOOTH_SCROLL_DURATION,
         }
     }
 }
@@ -460,6 +469,13 @@ impl Config {
             status_foreground: o.status_foreground.unwrap_or(base.status_foreground),
             accent: o.accent.unwrap_or(base.accent),
         }
+    }
+
+    /// The time of one smooth scroll. `None` when the scroll is instant:
+    /// `smooth-scroll = false` or `smooth-scroll-duration = 0`.
+    pub fn smooth_scroll_time(&self) -> Option<std::time::Duration> {
+        (self.smooth_scroll && self.smooth_scroll_duration > 0)
+            .then(|| std::time::Duration::from_millis(self.smooth_scroll_duration))
     }
 
     /// `row_height`, or `round(font_size * 1.55)`: 20 pt for 13 pt text.
@@ -650,6 +666,14 @@ impl Config {
             "toolbar" => self.toolbar = if empty { true } else { boolean(key, value)? },
             "column-header" => self.column_header = if empty { true } else { boolean(key, value)? },
             "path-bar" => self.path_bar = if empty { true } else { boolean(key, value)? },
+            "smooth-scroll" => self.smooth_scroll = if empty { true } else { boolean(key, value)? },
+            "smooth-scroll-duration" => {
+                self.smooth_scroll_duration = if empty {
+                    DEFAULT_SMOOTH_SCROLL_DURATION
+                } else {
+                    integer(key, value, 0, 1000)?
+                }
+            }
             "keybind" => {
                 if value == "clear" {
                     self.keymap.clear();
@@ -790,6 +814,14 @@ fn number(key: &str, value: &str, min: f64, max: f64) -> Result<f64, String> {
         Ok(_) if max == f64::MAX => Err(format!("{key} must be at least {min}, got {value}")),
         Ok(_) => Err(format!("{key} must be from {min} to {max}, got {value}")),
         Err(_) => Err(format!("invalid number for {key}: {value}")),
+    }
+}
+
+fn integer(key: &str, value: &str, min: u64, max: u64) -> Result<u64, String> {
+    match value.parse::<u64>() {
+        Ok(n) if (min..=max).contains(&n) => Ok(n),
+        Ok(_) => Err(format!("{key} must be from {min} to {max}, got {value}")),
+        Err(_) => Err(format!("invalid whole number for {key}: {value}")),
     }
 }
 
@@ -1014,6 +1046,24 @@ const TEMPLATE_SECTIONS: &[(&str, &[TemplateKey])] = &[
                 "auto-refresh",
                 "true",
                 &["Read the folder again when it changes on disk: true or false."],
+            ),
+            tk(
+                "smooth-scroll",
+                "true",
+                &[
+                    "Animate the page moves: true or false. The view and the cursor move together,",
+                    "like vim with smooth scroll. The actions: half_page_down, half_page_up,",
+                    "page_down, page_up, cursor_top, and cursor_bottom.",
+                    "The animation is off when the macOS setting Reduce Motion is on.",
+                ],
+            ),
+            tk(
+                "smooth-scroll-duration",
+                "150",
+                &[
+                    "The time of one smooth scroll in milliseconds. Valid values: 0 to 1000.",
+                    "The value 0 turns the animation off.",
+                ],
             ),
         ],
     ),
@@ -1409,6 +1459,34 @@ mod tests {
     }
 
     #[test]
+    fn smooth_scroll_keys() {
+        let c = Config::default();
+        assert!(c.smooth_scroll);
+        assert_eq!(c.smooth_scroll_duration, 150);
+        assert_eq!(
+            c.smooth_scroll_time(),
+            Some(std::time::Duration::from_millis(150))
+        );
+        let c = clean("smooth-scroll = false\nsmooth-scroll-duration = 300\n");
+        assert!(!c.smooth_scroll);
+        assert_eq!(c.smooth_scroll_duration, 300);
+        assert_eq!(c.smooth_scroll_time(), None);
+        let c = clean("smooth-scroll-duration = 0\n");
+        assert!(c.smooth_scroll);
+        assert_eq!(c.smooth_scroll_time(), None);
+        let c = clean("smooth-scroll-duration = 1000\nsmooth-scroll-duration =\n");
+        assert_eq!(c.smooth_scroll_duration, 150);
+        for bad in ["1001", "-1", "1.5", "fast", "150ms"] {
+            let (c, diags) = parse(&format!("smooth-scroll-duration = {bad}\n"));
+            assert_eq!(diags.len(), 1, "{bad}");
+            assert!(diags[0].message.contains("smooth-scroll-duration"), "{bad}");
+            // The old value stays.
+            assert_eq!(c.smooth_scroll_duration, 150, "{bad}");
+        }
+        assert_eq!(parse("smooth-scroll = yes\n").1.len(), 1);
+    }
+
+    #[test]
     fn keybind_lines() {
         use crate::action::Action;
         use crate::keymap::{Key, KeyEvent, KeyOutcome, KeymapState, Mods};
@@ -1691,6 +1769,8 @@ mod tests {
             "toolbar",
             "column-header",
             "path-bar",
+            "smooth-scroll",
+            "smooth-scroll-duration",
         ];
         for key in expected {
             assert!(keys.contains(&key), "missing {key}");

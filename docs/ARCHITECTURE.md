@@ -18,6 +18,7 @@ Measure with a release build (`cargo build --release`).
 | Launch to first frame with entries | < 150 ms |
 | Read and sort a directory with 10 000 entries | < 50 ms |
 | Key press to new frame | < 8 ms |
+| One frame of a smooth scroll | < 2 ms |
 | Scroll a list of 100 000 entries | No dropped frames |
 | Disk IO on the main thread | Only for one-file operations (rename, new folder, trash) |
 
@@ -43,9 +44,10 @@ This is the Ghostty model: a core library and a thin native shell. The shell con
 | `color` | `Rgba` colors and the parser for color values in themes. |
 | `fs` | `read_dir`, `Entry`, hidden and package rules, path helpers. |
 | `sort` | Natural sort, sort keys. |
-| `filter` | Live filter (substring or fuzzy, smart case). |
+| `filter` | Live filter (substring or fuzzy, smart case). The test that tells a path from a filter in the location field. |
 | `format` | Size and date text. |
 | `pane` | Navigation state: directory, entries, cursor, history, cursor memory, filter. |
+| `viewport` | Scroll arithmetic with the vim rules: half page, page, top, bottom, and the 2-row margin of line moves. Pure functions. |
 
 The public API of `bf-core` is the contract with `bf-app`. The doc comments in the source are the specification.
 
@@ -56,18 +58,19 @@ The public API of `bf-core` is the contract with `bf-app`. The doc comments in t
 | `main` | CLI arguments. The `+` commands. Starts `NSApplication`. |
 | `app` | The app delegate, the main menu, the app state, the dispatch of actions. |
 | `window` | The `NSWindow`, the split view (sidebar and content), the column header, the list, the prompt, the path and status bar, and the help overlay. |
-| `list_view` | A custom `NSView` in an `NSScrollView`. It draws only the visible rows. It handles keys and the mouse. It is the controller of the Quick Look panel. |
+| `list_view` | A custom `NSView` in an `NSScrollView`. It draws only the dirty rows. It handles keys and the mouse. It is the controller of the Quick Look panel. During a smooth scroll, a small subview shows the moving cursor highlight. |
 | `columns` | The text of the list columns: size, Kind, and dates. It follows the locale, like Finder. |
 | `header` | The column header above the list. A click on a title sorts the list. |
 | `sidebar` | The sidebar (`NSOutlineView`, source list style) with Favorites and Locations. A background thread builds the model. |
-| `toolbar` | The unified toolbar: back, forward, and the Filter field. The window title shows the path. |
+| `toolbar` | The unified toolbar: back, forward, and the location and filter field. The window title shows the path. |
 | `status_bar` | One line at the bottom. It draws the path bar (crumbs), and the counts, free space, filter, pending keys, and messages. |
-| `prompt` | The text inputs: the bottom line for go to folder (and filter when the toolbar is off), the inline rename field, and the toolbar filter field. |
-| `goto_panel` | The Go to Folder panel with up to 8 matching folders. `Tab` completes the path. |
-| `help` | The key binding help overlay. `Escape` or `?` closes it. |
+| `prompt` | The text inputs: the bottom line (the location and filter field when the toolbar is off), the inline rename field, and the toolbar field. One delegate serves all of them. |
+| `goto_panel` | The Go to Folder panel with up to 8 matching folders. `Tab` completes the path. The same view without a field is the match list of the location field. |
+| `help` | The key binding help overlay. It takes the keyboard focus. The movement keys of the keymap scroll it. `cancel`, `help`, and `q` close it. |
+| `smooth` | The smooth scroll driver for the list and the help overlay. A display link moves the clip view and the cursor highlight with an ease-out curve. |
 | `file_ops` | File system helpers with data-safety rules, for example a rename that never replaces an item. |
 | `quicklook` | `QLPreviewPanel` data source and delegate. |
-| `icons` | File icons from `NSWorkspace`, with a cache. |
+| `icons` | File icons from `NSWorkspace`, with a cache. Each icon renders one time into a bitmap at the draw size. |
 | `theme` | `Rgba` to `NSColor`, fonts, row metrics. |
 | `loader` | Runs `bf_core::fs::read_dir` on a background thread. Sends the result to the main queue. |
 | `watcher` | Watches the current directory and the config files. Debounces the events. |
@@ -84,7 +87,15 @@ The public API of `bf-core` is the contract with `bf-app`. The doc comments in t
 2. `KeymapState::feed` gives `Action`, `Pending`, or `Unbound`.
 3. `app::dispatch(action)` changes the `Pane` or does an operation, then asks for a redraw.
 
-When the prompt is open, the text field gets the keys. `Enter` accepts and `Escape` cancels. In the filter prompt, `Up` and `Down` move the list cursor.
+When the prompt is open, the text field gets the keys. `Enter` accepts and `Escape` cancels. In the filter prompt, `Up` and `Down` move the list cursor. A path in the filter field (`filter::is_path_query`) shows the matching folders: `Up` and `Down` select a match, `Tab` completes, and `Enter` goes.
+
+When the help overlay is open, it has the keyboard focus. `app::help_key` sends the key through the keymap: the movement actions scroll the overlay, and the other actions do nothing (except `cancel`, `help`, and `quit`).
+
+### Smooth scroll
+
+1. A page action (`half_page_down`, `page_down`, `cursor_top`, and the others) gets the target from `viewport::Viewport::apply`. The pane cursor changes at once.
+2. `sync_ui` gives the target to `smooth::scroll_list`. A display link moves the clip view and the highlight subview to the target in `smooth-scroll-duration` milliseconds.
+3. A new page action during the animation starts from the current position (a retarget). Any other key, a mouse scroll, a resize, or a change of the list ends the animation at its target.
 
 ### Directory load
 

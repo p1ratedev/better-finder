@@ -3,10 +3,10 @@
 A fast, keyboard-first file explorer for macOS. It is written in Rust. You configure it with a dotfile, like Ghostty.
 
 - **Fast.** Native AppKit. A custom list view draws only the visible rows. Directory reads run on a background thread.
-- **Keyboard first.** It has vim keys and Finder keys by default. You can bind any key or key sequence to any action.
+- **Keyboard first.** It has vim keys and Finder keys by default. You can bind any key or key sequence to any action. The page keys scroll smoothly, like nvim with smooth scroll: the view and the cursor move together.
 - **Configured with a dotfile.** One plain text file, `~/.config/better-finder/config`. The app reloads it without a restart.
 - **Native Quick Look.** Press `Space` to preview a file, like in Finder.
-- **Finder-style UI.** It has a glass sidebar with Favorites and Locations, and a toolbar with a Filter field. It has a column header with sort, a Kind column, and a path bar. The system theme follows the macOS accent color. Rename happens inline in the list.
+- **Finder-style UI.** It has a glass sidebar with Favorites and Locations, and a toolbar with a field that filters the list or goes to a path. It has a column header with sort, a Kind column, and a path bar. The system theme follows the macOS accent color. Rename happens inline in the list.
 
 See [docs/UI.md](docs/UI.md) for the UI design contract.
 
@@ -61,6 +61,10 @@ columns = size,kind,modified
 date-format = finder
 terminal = Ghostty
 
+# Scroll
+smooth-scroll = true
+smooth-scroll-duration = 150
+
 # Keys
 keybind = g>p=goto:~/Apps/personal-projects
 keybind = d=unbind
@@ -86,9 +90,10 @@ better-finder +validate-config         # check the config file for errors
 | `h`, `Backspace`, `cmd+up` | Go to the parent directory |
 | `H` `L`, `cmd+[` `cmd+]` | Back and forward |
 | `gg` `G` | Top and bottom |
-| `ctrl+d` `ctrl+u` | Half page down and up |
+| `ctrl+d` `ctrl+u` | Half page down and up (smooth scroll) |
+| `ctrl+f` `ctrl+b`, `PageDown` `PageUp` | Page down and up (smooth scroll) |
 | `Space` | Quick Look |
-| `/`, `cmd+f` | Filter |
+| `/`, `cmd+f` | Filter, or go to a path: text that starts with `~`, contains `/`, or is `..` shows the matching folders. `Tab` completes, `Enter` goes |
 | `Tab` | Focus the sidebar (`Tab` again gives the focus back to the list) |
 | `cmd+ctrl+s` | Show or hide the sidebar |
 | `.`, `cmd+shift+.` | Show or hide hidden files |
@@ -102,7 +107,7 @@ better-finder +validate-config         # check the config file for errors
 | `cmd+Backspace` | Move to Trash |
 | `cc` `cn` | Copy the path or the name |
 | `T` | Open a terminal here |
-| `?` | Show all key bindings |
+| `?` | Show all key bindings. `j` `k` and the page keys scroll the overlay. `q`, `Escape`, or `?` closes it |
 | `cmd+,` `cmd+shift+,` | Open and reload the config |
 
 ## Architecture

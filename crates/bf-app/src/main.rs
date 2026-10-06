@@ -17,6 +17,7 @@ mod loader;
 mod prompt;
 mod quicklook;
 mod sidebar;
+mod smooth;
 mod status_bar;
 mod theme;
 mod toolbar;

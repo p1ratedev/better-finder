@@ -6,7 +6,7 @@
 //! toolbar; the column header stays pinned below it. `RootView` reads the
 //! safe area for the height that the title bar and the toolbar cover.
 
-use std::cell::{Cell, OnceCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::sync::OnceLock;
 
 use bf_core::config::{Config, ThemeMode, TitlebarStyle};
@@ -47,6 +47,10 @@ pub struct RootIvars {
     help: OnceCell<HelpUi>,
     goto: OnceCell<Retained<GotoPanel>>,
     goto_height: Cell<f64>,
+    /// The match list of the location field, its height, and the field.
+    location: OnceCell<Retained<GotoPanel>>,
+    location_height: Cell<f64>,
+    location_anchor: RefCell<Option<Retained<NSView>>>,
     header_height: Cell<f64>,
     status_height: Cell<f64>,
     prompt_height: Cell<f64>,
@@ -121,6 +125,15 @@ impl RootView {
         self.layout_children();
     }
 
+    /// Shows the match list of the location field next to `anchor` (the
+    /// field) with `height`, or hides it (`None`).
+    pub fn set_location(&self, anchor: Option<Retained<NSView>>, height: f64) {
+        let height = if anchor.is_some() { height } else { 0.0 };
+        self.ivars().location_height.set(height);
+        *self.ivars().location_anchor.borrow_mut() = anchor;
+        self.layout_children();
+    }
+
     /// Shows or hides the help overlay. `height` is the content height.
     pub fn set_help(&self, visible: bool, height: f64) {
         self.ivars().help_visible.set(visible);
@@ -189,6 +202,9 @@ impl RootView {
                 ));
             }
         }
+        if let Some(list) = iv.location.get() {
+            self.layout_location(list, top, w);
+        }
         if let Some(help) = iv.help.get() {
             let visible = iv.help_visible.get();
             help.scroll.setHidden(!visible);
@@ -198,6 +214,36 @@ impl RootView {
                 help.view.set_content_height(iv.help_height.get());
             }
         }
+    }
+}
+
+impl RootView {
+    /// Puts the match list of the location field below the field (the
+    /// toolbar field), or above it (the bottom prompt). `top` is the height
+    /// that the title bar and the toolbar cover.
+    fn layout_location(&self, list: &GotoPanel, top: f64, w: f64) {
+        let iv = self.ivars();
+        let height = iv.location_height.get();
+        let anchor = iv.location_anchor.borrow().clone();
+        let Some(anchor) = anchor.filter(|_| height > 0.0) else {
+            list.setHidden(true);
+            return;
+        };
+        let field = self.convertRect_fromView(anchor.bounds(), Some(&anchor));
+        let below = field.origin.y + field.size.height / 2.0 < self.bounds().size.height / 2.0;
+        let width = field.size.width.max(320.0).min((w - 16.0).max(0.0));
+        let (x, y) = if below {
+            // Right-aligned with the toolbar field.
+            let x = field.origin.x + field.size.width - width;
+            (x, (field.origin.y + field.size.height + 8.0).max(top + 4.0))
+        } else {
+            // The text of the rows lines up with the text of the field.
+            let x = field.origin.x - goto_panel::TEXT_X;
+            (x, field.origin.y - 10.0 - height)
+        };
+        let x = x.clamp(8.0, (w - width - 8.0).max(8.0));
+        list.setFrame(rect(x.round(), y.round(), width, height));
+        list.setHidden(false);
     }
 }
 
@@ -219,6 +265,8 @@ pub struct Ui {
     pub prompt: PromptUi,
     pub help: HelpUi,
     pub goto: Retained<GotoPanel>,
+    /// The match list of the location field (the filter field with a path).
+    pub location: Retained<GotoPanel>,
     pub sidebar: SidebarUi,
     pub toolbar: ToolbarUi,
 }
@@ -290,6 +338,8 @@ pub fn create_views(
     let help = help::create(mtm);
     let goto = goto_panel::create(mtm, &delegate);
     goto_panel::set_shadow(&goto);
+    let location = goto_panel::create_list(mtm);
+    goto_panel::set_shadow(&location);
 
     root.addSubview(&scroll);
     root.addSubview(&header);
@@ -297,6 +347,7 @@ pub fn create_views(
     root.addSubview(&status);
     root.addSubview(&help.scroll);
     root.addSubview(&goto);
+    root.addSubview(&location);
     let iv = root.ivars();
     let _ = iv.scroll.set(scroll.clone());
     let _ = iv.list.set(list.clone());
@@ -305,6 +356,7 @@ pub fn create_views(
     let _ = iv.prompt.set(prompt.bar.clone());
     let _ = iv.help.set(help.clone());
     let _ = iv.goto.set(goto.clone());
+    let _ = iv.location.set(location.clone());
 
     let sidebar = sidebar::create(mtm);
     let split = NSSplitViewController::new(mtm);
@@ -377,6 +429,7 @@ pub fn create_views(
         prompt,
         help,
         goto,
+        location,
         sidebar,
         toolbar,
     }

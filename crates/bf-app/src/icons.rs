@@ -10,15 +10,23 @@
 //! - The app asks for them only on a local volume (the loader decides).
 //! - `drawRect:` only puts a path in a queue. After the frame, `resolve`
 //!   gets a few icons, caches them by path, and redraws the list.
+//!
+//! A draw of an `NSWorkspace` icon costs about 65 µs. `draw_icon` renders
+//! each icon one time into a bitmap at the draw size, and then draws the
+//! bitmap (a few µs). This keeps a frame of the smooth scroll short.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use bf_core::{Entry, EntryKind};
+use objc2::AnyThread;
 use objc2::rc::Retained;
-use objc2_app_kit::{NSColor, NSImage, NSImageSymbolConfiguration, NSWorkspace};
-use objc2_foundation::{NSArray, NSString};
+use objc2_app_kit::{
+    NSBitmapImageRep, NSCalibratedRGBColorSpace, NSColor, NSCompositingOperation,
+    NSGraphicsContext, NSImage, NSImageSymbolConfiguration, NSWorkspace,
+};
+use objc2_foundation::{NSArray, NSPoint, NSRect, NSSize, NSString};
 use objc2_uniform_type_identifiers::{
     UTType, UTTypeData, UTTypeFolder, UTTypeSymbolicLink, UTTypeUnixExecutable, UTTypeVolume,
 };
@@ -88,6 +96,107 @@ pub fn volume_icon() -> Option<Retained<NSImage>> {
                 .clone(),
         )
     })
+}
+
+/// Icons rendered at one pixel size: (address of the source, pixels) to
+/// (source, bitmap). The entry keeps the source alive, so its address stays
+/// unique.
+type Rasters = HashMap<(usize, u32), (Retained<NSImage>, Retained<NSImage>)>;
+
+thread_local! {
+    static RASTERS: RefCell<Rasters> = RefCell::new(HashMap::new());
+}
+
+/// The most bitmaps in the cache. A full cache clears.
+const MAX_RASTERS: usize = 512;
+
+/// Draws a file icon into `rect` (a flipped view) with `alpha`. The first
+/// draw renders the icon into a bitmap for the size of `rect` and the
+/// backing `scale`. Later draws use the bitmap.
+pub fn draw_icon(image: &Retained<NSImage>, rect: NSRect, alpha: f64, scale: f64) {
+    let px = (rect.size.width * scale).round().max(1.0) as u32;
+    let key = (Retained::as_ptr(image) as usize, px);
+    let cached = RASTERS.with(|r| {
+        r.try_borrow()
+            .ok()?
+            .get(&key)
+            .map(|(_, raster)| raster.clone())
+    });
+    let raster = cached.or_else(|| {
+        let raster = rasterize(image, rect.size.width, px)?;
+        RASTERS.with(|r| {
+            if let Ok(mut r) = r.try_borrow_mut() {
+                if r.len() >= MAX_RASTERS {
+                    r.clear();
+                }
+                r.insert(key, (image.clone(), raster.clone()));
+            }
+        });
+        Some(raster)
+    });
+    let image: &NSImage = raster.as_deref().unwrap_or(image);
+    // SAFETY: A `None` hints dictionary is valid. The views are flipped, so
+    // `respectFlipped` must be true.
+    unsafe {
+        image.drawInRect_fromRect_operation_fraction_respectFlipped_hints(
+            rect,
+            NSRect::ZERO,
+            NSCompositingOperation::SourceOver,
+            alpha,
+            true,
+            None,
+        );
+    }
+}
+
+/// Renders `image` into a bitmap of `px` x `px` pixels for a size of
+/// `size` points. Call it in a draw: the folder icon follows the current
+/// drawing appearance.
+fn rasterize(image: &NSImage, size: f64, px: u32) -> Option<Retained<NSImage>> {
+    let px = isize::try_from(px).ok()?;
+    // SAFETY: Null planes make AppKit allocate the pixel memory. The color
+    // space name is an immutable static from AppKit.
+    let rep = unsafe {
+        NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+            NSBitmapImageRep::alloc(),
+            std::ptr::null_mut(),
+            px,
+            px,
+            8,
+            4,
+            true,
+            false,
+            NSCalibratedRGBColorSpace,
+            0,
+            0,
+        )
+    }?;
+    let points = NSSize::new(size, size);
+    rep.setSize(points);
+    let context = NSGraphicsContext::graphicsContextWithBitmapImageRep(&rep)?;
+    NSGraphicsContext::saveGraphicsState_class();
+    NSGraphicsContext::setCurrentContext(Some(&context));
+    image.drawInRect_fromRect_operation_fraction(
+        NSRect::new(NSPoint::new(0.0, 0.0), points),
+        NSRect::ZERO,
+        NSCompositingOperation::SourceOver,
+        1.0,
+    );
+    context.flushGraphics();
+    NSGraphicsContext::restoreGraphicsState_class();
+    let out = NSImage::initWithSize(NSImage::alloc(), points);
+    out.addRepresentation(&rep);
+    Some(out)
+}
+
+/// Removes the rendered bitmaps. Call it when the appearance or the accent
+/// color changes (the folder icon follows them).
+pub fn clear_rasters() {
+    RASTERS.with(|r| {
+        if let Ok(mut r) = r.try_borrow_mut() {
+            r.clear();
+        }
+    });
 }
 
 /// Draws `image` into `rect` (flipped view).

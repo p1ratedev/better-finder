@@ -18,9 +18,11 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 use bf_core::config::{Diagnostic, ThemeMode, default_config_template};
+use bf_core::filter::is_path_query;
 use bf_core::fs::{display_path, expand_path, home_dir};
 use bf_core::keymap::{Key, KeyPress, NamedKey};
 use bf_core::pane::{LoadKind, PaneOptions};
+use bf_core::viewport::{self, Motion, Position, Viewport};
 use bf_core::{
     Action, Config, Entry, EntryKind, KeyEvent, KeyOutcome, Keymap, KeymapState, LoadRequest,
     LoadResult, OpenOutcome, Pane,
@@ -50,6 +52,7 @@ use crate::loader::{self, Delivery};
 use crate::prompt::{self, PromptMode};
 use crate::quicklook;
 use crate::sidebar;
+use crate::smooth::{self, ListScroll, Target};
 use crate::status_bar::StatusBar;
 use crate::theme::{self, Style};
 use crate::watcher;
@@ -77,6 +80,16 @@ struct GotoState {
     selected: Option<usize>,
     /// The number of the most recent query. Old results are ignored.
     query: u64,
+}
+
+impl GotoState {
+    /// Removes the matches. The query number stays, so that the results
+    /// of old queries stay old.
+    fn clear(&mut self) {
+        self.dir_text.clear();
+        self.matches.clear();
+        self.selected = None;
+    }
 }
 
 /// The options of a normal app start, from the command line.
@@ -122,6 +135,8 @@ struct Rendered {
     row_height: f64,
     history: (bool, bool),
     sort: Option<bf_core::sort::SortOptions>,
+    /// The match list of the location field: its place and the number of rows.
+    location: Option<(PromptPlace, usize)>,
 }
 
 /// All state of the app. Main thread only.
@@ -144,6 +159,11 @@ pub struct AppState {
     /// Open the inline rename on this path after the next load (new folder).
     pending_rename: Option<PathBuf>,
     goto: GotoState,
+    /// The filter prompt has a path (the location field): `goto` has its
+    /// matches, and `Enter` goes to the path.
+    path_mode: bool,
+    /// A page action: the scroll of the list for the next `sync_ui`.
+    scroll_plan: Option<ListScroll>,
     /// (directory, name): put the cursor on `name` after the next load of `directory`.
     pending_select: Option<(PathBuf, String)>,
     message_id: u64,
@@ -262,7 +282,9 @@ define_class!(
         #[unsafe(method(systemColorsChanged:))]
         fn system_colors_changed(&self, _notification: &NSNotification) {
             // The accent color changed. The system colors are dynamic: a
-            // redraw shows the new color.
+            // redraw shows the new color. The folder icon bitmaps follow
+            // the accent color: render them again.
+            icons::clear_rasters();
             after_now(redraw_all);
         }
 
@@ -557,6 +579,8 @@ pub fn run(options: RunOptions) -> ExitCode {
         volume: None,
         pending_rename: None,
         goto: GotoState::default(),
+        path_mode: false,
+        scroll_plan: None,
         pending_select: select.map(|name| (start, name)),
         message_id: 0,
         load_generation: generation,
@@ -656,8 +680,18 @@ fn show_window() {
     // The filter field and the sidebar rows come after the first frame:
     // they cost about 25 ms, and the layout does not change when they come.
     after_now(add_search_field);
+    // The display link of the smooth scroll: make it now, so that the first
+    // page action does not wait for it.
+    after_now(prepare_smooth_scroll);
     if let Some(model) = model {
         after_now(move || sidebar::apply_model(model));
+    }
+}
+
+fn prepare_smooth_scroll() {
+    let list = with_ref(|s| s.config.smooth_scroll_time().map(|_| s.ui.list.clone()));
+    if let Some(Some(list)) = list {
+        smooth::prepare(&list);
     }
 }
 
@@ -715,8 +749,12 @@ fn repeat_allowed(action: &Action) -> bool {
 /// Sends one key event to the keymap. True when the key had a use.
 /// `repeat` is true for the automatic repeats of a held key: they do only
 /// cursor moves, so a held key never trashes or opens many items.
-/// While the prompt is open, the keymap gets no keys (false).
+/// While the prompt is open, the keymap gets no keys (false). While the
+/// help overlay is open, the keys go to the overlay (`help_key`).
 pub fn handle_key(event: KeyEvent, repeat: bool) -> bool {
+    if with_ref(|s| s.prompt.is_none() && s.help.is_some()) == Some(true) {
+        return help_key(event, repeat);
+    }
     let fed = with(|s| {
         if s.prompt.is_some() {
             return None;
@@ -727,6 +765,11 @@ pub fn handle_key(event: KeyEvent, repeat: bool) -> bool {
     let Some(Some((outcome, had_pending))) = fed else {
         return false;
     };
+    // A key other than a page action ends a smooth scroll at its target.
+    // A page action during a scroll is a retarget.
+    if !matches!(&outcome, KeyOutcome::Action(a) if is_page_action(a)) {
+        smooth::finish();
+    }
     match outcome {
         KeyOutcome::Action(action) => {
             if !repeat || repeat_allowed(&action) {
@@ -745,6 +788,99 @@ pub fn handle_key(event: KeyEvent, repeat: bool) -> bool {
             had_pending
         }
     }
+}
+
+/// True for the actions that scroll with the smooth scroll rules.
+fn is_page_action(action: &Action) -> bool {
+    Motion::from_action(action).is_some_and(Motion::animates)
+}
+
+/// What a key does in the help overlay.
+enum HelpKey {
+    Close,
+    Quit,
+    Scroll(Motion, String),
+    /// A key of a sequence (`g` of `g>g`).
+    Pending,
+    /// A bound key without a use in the overlay.
+    Ignored,
+    /// No binding: the key can go to the main menu.
+    Unbound,
+}
+
+/// A key while the help overlay is open. The key goes through the user
+/// keymap: the movement actions scroll the overlay, `cancel` and `help`
+/// close it, and `quit` quits. The key `q` also closes it. The overlay
+/// ignores the other actions. True when the key had a use.
+fn help_key(event: KeyEvent, repeat: bool) -> bool {
+    let what = with(|s| {
+        let plain_q = event.base == Key::Char('q') && event.mods == Default::default();
+        if plain_q && s.keys.pending().is_empty() {
+            return HelpKey::Close;
+        }
+        let had_pending = !s.keys.pending().is_empty();
+        match s.keys.feed(&s.config.keymap, &event) {
+            KeyOutcome::Action(Action::Help | Action::Cancel) => HelpKey::Close,
+            KeyOutcome::Action(Action::Quit) => HelpKey::Quit,
+            KeyOutcome::Action(action) => match Motion::from_action(&action) {
+                Some(motion) => HelpKey::Scroll(motion, action.to_string()),
+                None => HelpKey::Ignored,
+            },
+            KeyOutcome::Pending => HelpKey::Pending,
+            KeyOutcome::Unbound if had_pending => HelpKey::Pending,
+            KeyOutcome::Unbound => HelpKey::Unbound,
+        }
+    });
+    let Some(what) = what else {
+        return false;
+    };
+    match what {
+        HelpKey::Close => {
+            if !repeat {
+                dispatch(Action::Help);
+            }
+        }
+        HelpKey::Quit => {
+            if !repeat {
+                dispatch(Action::Quit);
+            }
+        }
+        HelpKey::Scroll(motion, label) => help_scroll(motion, &label),
+        HelpKey::Pending => redraw_status(),
+        HelpKey::Ignored => {}
+        HelpKey::Unbound => return false,
+    }
+    true
+}
+
+/// Scrolls the help overlay with the smooth scroll rules. One step is one
+/// line of the overlay. The line moves do not animate.
+fn help_scroll(motion: Motion, label: &str) {
+    let info = with_ref(|s| {
+        (
+            s.ui.help.clone(),
+            s.style.row_height,
+            s.config.smooth_scroll_time(),
+        )
+    });
+    let Some((help, line, time)) = info else {
+        return;
+    };
+    if line <= 0.0 {
+        return;
+    }
+    let bounds = help.scroll.contentView().bounds();
+    let content = help.view.frame().size.height;
+    // During an animation, the next move starts from its target.
+    let top = smooth::target_y(Target::Help).unwrap_or(bounds.origin.y);
+    let new_top = viewport::scroll_view(
+        top / line,
+        content / line,
+        bounds.size.height / line,
+        motion,
+    );
+    let duration = time.filter(|_| motion.animates());
+    smooth::scroll_help(&help.scroll, (new_top * line).round(), duration, label);
 }
 
 /// Work for AppKit that must run after the state borrow ends.
@@ -849,13 +985,42 @@ fn run_effects(mtm: MainThreadMarker, effects: Vec<Effect>) {
                 else {
                     continue;
                 };
-                ui.root.set_help(height.is_some(), height.unwrap_or(0.0));
-                ui.help.view.setNeedsDisplay(true);
+                show_help(&ui, height);
             }
             Effect::ReloadConfig => reload_config(),
             Effect::WatchConfig => watch_config_files(),
             Effect::Quit => NSApplication::sharedApplication(mtm).terminate(None),
         }
+    }
+}
+
+/// Shows the help overlay with the content `height`, or hides it (`None`).
+/// The overlay takes the keyboard focus while it is open.
+fn show_help(ui: &Ui, height: Option<f64>) {
+    let visible = height.is_some();
+    let was_visible = !ui.help.scroll.isHidden();
+    if visible != was_visible {
+        smooth::finish();
+    }
+    ui.root.set_help(visible, height.unwrap_or(0.0));
+    ui.help.view.setNeedsDisplay(true);
+    let help_responder: &NSResponder = ui.help.view.as_super().as_super();
+    let help_first = ui.window.firstResponder().is_some_and(|r| {
+        std::ptr::eq(
+            Retained::as_ptr(&r).cast::<u8>(),
+            Retained::as_ptr(&ui.help.view).cast::<u8>(),
+        )
+    });
+    if visible && !was_visible {
+        // A new overlay starts at the top.
+        let clip = ui.help.scroll.contentView();
+        clip.scrollToPoint(objc2_foundation::NSPoint::new(0.0, 0.0));
+        ui.help.scroll.reflectScrolledClipView(&clip);
+    }
+    if visible && !help_first {
+        ui.window.makeFirstResponder(Some(help_responder));
+    } else if !visible && help_first {
+        ui.window.makeFirstResponder(Some(list_responder(&ui.list)));
     }
 }
 
@@ -888,7 +1053,7 @@ fn open_prompt_view(place: PromptPlace, label: &str, text: &str, select: (usize,
             }
         }
         PromptPlace::Panel => {
-            with(|s| s.goto = GotoState::default());
+            with(|s| s.goto.clear());
             ui.root.set_goto(Some(crate::goto_panel::height(0)));
             if let Some(field) = ui.goto.field() {
                 prompt::focus_field(&ui.window, field, text, select, &caret);
@@ -1086,11 +1251,45 @@ impl AppState {
         self.set_message(text.into(), true);
     }
 
-    /// Visible rows minus one, at least one.
-    fn page_rows(&self) -> isize {
-        let height = self.ui.scroll.contentSize().height;
-        let rows = (height / self.style.row_height).floor().max(0.0) as isize;
-        (rows - 1).max(1)
+    /// A page action with the vim rules (`bf_core::viewport`). The pane
+    /// cursor changes at once. `sync_ui` then moves the view and the
+    /// highlight to the target, with an animation when it is on.
+    fn page_motion(&mut self, action: &Action) {
+        let Some(motion) = Motion::from_action(action) else {
+            return;
+        };
+        let Some(view) = self.ui.list.view_rows() else {
+            return;
+        };
+        let h = view.row_height;
+        // During an animation, the next move starts from its target.
+        let top = smooth::target_y(Target::List).map_or(view.top, |y| (y + view.inset) / h);
+        let viewport = Viewport {
+            len: self.pane.visible_len(),
+            height: view.height,
+        };
+        let from = self.pane.cursor();
+        let to = viewport.apply(Position { cursor: from, top }, motion);
+        self.pane.set_cursor(to.cursor);
+        self.reveal_cursor = false;
+        self.scroll_plan = Some(ListScroll {
+            to_y: to.top * h - view.inset,
+            from_row: from,
+            to_row: to.cursor,
+            row_height: h,
+            inset: view.inset,
+            label: action.to_string(),
+        });
+    }
+
+    /// True when the filter prompt has a path (the location field).
+    fn location_active(&self) -> bool {
+        self.path_mode && self.prompt == Some(PromptMode::Filter)
+    }
+
+    /// True when a prompt takes a path: the "go to" panel or the location field.
+    fn goto_active(&self) -> bool {
+        self.prompt == Some(PromptMode::Goto) || self.location_active()
     }
 
     fn start_load(&mut self, request: LoadRequest) {
@@ -1161,6 +1360,7 @@ impl AppState {
         }
         self.prompt = Some(mode);
         self.prompt_place = place;
+        self.path_mode = false;
         // The Quick Look panel sends keys to the keymap. Close it, so that
         // the typed text goes only to the prompt.
         if ql_visible {
@@ -1179,6 +1379,7 @@ impl AppState {
 
     fn close_prompt(&mut self, fx: &mut Vec<Effect>) {
         self.prompt = None;
+        self.path_mode = false;
         fx.push(Effect::ClosePrompt(self.prompt_place));
     }
 
@@ -1232,17 +1433,15 @@ impl AppState {
         if self.message.as_ref().is_some_and(|m| m.error) {
             self.message = None;
         }
-        let page = self.page_rows();
-        let half = (page / 2).max(1);
         match action {
             Action::CursorUp => self.pane.move_cursor(-1),
             Action::CursorDown => self.pane.move_cursor(1),
-            Action::CursorTop => self.pane.cursor_top(),
-            Action::CursorBottom => self.pane.cursor_bottom(),
-            Action::PageUp => self.pane.move_cursor(-page),
-            Action::PageDown => self.pane.move_cursor(page),
-            Action::HalfPageUp => self.pane.move_cursor(-half),
-            Action::HalfPageDown => self.pane.move_cursor(half),
+            Action::CursorTop
+            | Action::CursorBottom
+            | Action::PageUp
+            | Action::PageDown
+            | Action::HalfPageUp
+            | Action::HalfPageDown => self.page_motion(&action),
             Action::Open => match self.pane.open_current() {
                 OpenOutcome::Navigate(request) => self.start_load(request),
                 OpenOutcome::OpenFile(path) => fx.push(Effect::OpenFile(path)),
@@ -1443,35 +1642,9 @@ impl AppState {
             self.message = None;
         }
         match mode {
+            PromptMode::Filter if self.path_mode => self.accept_path(text, &mut fx),
             PromptMode::Filter => self.close_prompt(&mut fx),
-            PromptMode::Goto => {
-                // The selected match of the panel wins over the text.
-                let selected = self
-                    .goto
-                    .selected
-                    .and_then(|i| self.goto.matches.get(i))
-                    .map(|name| format!("{}{name}", self.goto.dir_text));
-                let text = selected.unwrap_or(text);
-                let input = text.trim();
-                if input.is_empty() {
-                    self.close_prompt(&mut fx);
-                    return fx;
-                }
-                // A `stat` can wait for a long time on a network volume.
-                // Do it on a thread; `goto_checked` continues.
-                let path = expand_path(input, self.pane.cwd());
-                self.goto_check += 1;
-                let id = self.goto_check;
-                let spawned = std::thread::Builder::new()
-                    .name("bf-goto".into())
-                    .spawn(move || {
-                        let is_dir = std::fs::metadata(&path).map(|m| m.is_dir());
-                        after_now(move || goto_checked(id, path, is_dir));
-                    });
-                if let Err(err) = spawned {
-                    self.set_error(format!("Cannot start a thread: {err}"));
-                }
-            }
+            PromptMode::Goto => self.accept_path(text, &mut fx),
             PromptMode::Rename { source } => {
                 let old = source.file_name().unwrap_or(OsStr::new(""));
                 let old_text = old.to_string_lossy().into_owned();
@@ -1505,13 +1678,53 @@ impl AppState {
         fx
     }
 
+    /// `Enter` in the "go to" panel or in the location field. The selected
+    /// match wins over the text. The path check runs on a thread, because a
+    /// `stat` can wait for a long time on a network volume; `goto_checked`
+    /// continues.
+    fn accept_path(&mut self, text: String, fx: &mut Vec<Effect>) {
+        let selected = self
+            .goto
+            .selected
+            .and_then(|i| self.goto.matches.get(i))
+            .map(|name| format!("{}{name}", self.goto.dir_text));
+        let text = selected.unwrap_or(text);
+        let input = text.trim();
+        if input.is_empty() {
+            self.close_prompt(fx);
+            return;
+        }
+        let path = expand_path(input, self.pane.cwd());
+        self.goto_check += 1;
+        let id = self.goto_check;
+        let spawned = std::thread::Builder::new()
+            .name("bf-goto".into())
+            .spawn(move || {
+                let is_dir = std::fs::metadata(&path).map(|m| m.is_dir());
+                after_now(move || goto_checked(id, path, is_dir));
+            });
+        if let Err(err) = spawned {
+            self.set_error(format!("Cannot start a thread: {err}"));
+        }
+    }
+
+    /// Closes the "go to" panel or the location field after a successful
+    /// check. The location field clears, and the list gets the focus.
+    fn close_path_prompt(&mut self, fx: &mut Vec<Effect>) {
+        if self.location_active() && self.prompt_place == PromptPlace::Search {
+            fx.push(Effect::ClearSearch);
+        }
+        self.close_prompt(fx);
+    }
+
     /// The result of the "go to" check: a directory opens, a file opens its
-    /// directory with the cursor on the file.
+    /// directory with the cursor on the file. A missing path shows an error,
+    /// and the prompt stays open.
     fn goto_result(&mut self, path: PathBuf, is_dir: io::Result<bool>) -> Vec<Effect> {
         let mut fx = Vec::new();
         match is_dir {
             Ok(true) => {
-                self.close_prompt(&mut fx);
+                self.close_path_prompt(&mut fx);
                 let request = self.pane.navigate_to(path);
                 self.start_load(request);
             }
@@ -1519,7 +1732,7 @@ impl AppState {
                 let parent = path.parent().map(Path::to_path_buf);
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
                 if let (Some(parent), Some(name)) = (parent, name) {
-                    self.close_prompt(&mut fx);
+                    self.close_path_prompt(&mut fx);
                     self.pending_select = Some((parent.clone(), name));
                     let request = self.pane.navigate_to(parent);
                     self.start_load(request);
@@ -1537,7 +1750,7 @@ fn goto_checked(id: u64, path: PathBuf, is_dir: io::Result<bool>) {
         return;
     };
     let effects = with(|s| {
-        if s.goto_check != id || s.prompt != Some(PromptMode::Goto) {
+        if s.goto_check != id || !s.goto_active() {
             return Vec::new();
         }
         s.goto_result(path, is_dir)
@@ -1828,29 +2041,65 @@ pub fn prompt_field() -> Option<Retained<objc2_app_kit::NSTextField>> {
     .flatten()
 }
 
+/// What a text change in a prompt does.
+enum TextChange {
+    Nothing,
+    /// The filter changed: update the list.
+    Filter,
+    /// A path: list the matching folders. `sync`: the views change too
+    /// (the location field shows or hides its match list).
+    Query {
+        sync: bool,
+    },
+}
+
 /// The text of a prompt changed. The filter updates the list live. A
 /// change in the toolbar filter field opens the filter mode (the user can
-/// click into the field).
+/// click into the field). In the filter field, a path (`is_path_query`)
+/// selects the path mode: the list shows all entries, and the field shows
+/// the matching folders, like the "go to" panel.
 pub fn prompt_changed(text: String, is_search: bool) {
-    let changed = with(|s| {
+    let change = with(|s| {
         if is_search && s.prompt.is_none() {
             s.prompt = Some(PromptMode::Filter);
             s.prompt_place = PromptPlace::Search;
+            s.path_mode = false;
         }
         if s.prompt == Some(PromptMode::Goto) && s.prompt_place == PromptPlace::Panel {
-            return None;
+            return TextChange::Query { sync: false };
         }
         if s.prompt != Some(PromptMode::Filter) {
-            return Some(false);
+            return TextChange::Nothing;
+        }
+        if is_path_query(&text) {
+            if !s.path_mode {
+                s.path_mode = true;
+                s.goto.clear();
+            }
+            if !s.pane.filter().is_empty() {
+                s.pane.clear_filter();
+                s.content_dirty = true;
+                s.reveal_cursor = true;
+            }
+            return TextChange::Query { sync: true };
+        }
+        if s.path_mode {
+            s.path_mode = false;
+            s.goto.clear();
         }
         s.pane.set_filter(&text);
         s.content_dirty = true;
         s.reveal_cursor = true;
-        Some(true)
+        TextChange::Filter
     });
-    match changed {
-        Some(Some(true)) => sync_ui(),
-        Some(None) => goto_query(text),
+    match change {
+        Some(TextChange::Filter) => sync_ui(),
+        Some(TextChange::Query { sync }) => {
+            goto_query(text);
+            if sync {
+                sync_ui();
+            }
+        }
         _ => {}
     }
 }
@@ -1922,6 +2171,7 @@ pub fn prompt_end_editing() {
         let mut fx = Vec::new();
         if s.prompt.is_some() {
             s.prompt = None;
+            s.path_mode = false;
             if s.prompt_place == PromptPlace::Inline {
                 fx.push(Effect::ClosePrompt(PromptPlace::Inline));
             } else if s.prompt_place == PromptPlace::Bar {
@@ -1935,14 +2185,24 @@ pub fn prompt_end_editing() {
     sync_ui();
 }
 
-/// Up and Down in the filter prompt move the list cursor.
+/// What Up or Down did in a prompt.
+enum PromptMove {
+    /// A match of the "go to" panel.
+    Panel,
+    /// A match of the location field.
+    Location,
+    /// The list cursor (filter), or nothing to select.
+    List,
+}
+
+/// Up and Down in the filter prompt move the list cursor. In the "go to"
+/// panel and in the location field, they select a match.
 pub fn prompt_move(delta: isize) -> bool {
     let moved = with(|s| {
-        if s.prompt == Some(PromptMode::Goto) && s.prompt_place == PromptPlace::Panel {
-            // Up and Down select a match of the "go to" panel.
+        if s.goto_active() {
             let count = s.goto.matches.len().min(crate::goto_panel::MAX_MATCHES);
             if count == 0 {
-                return Some(false);
+                return Some(PromptMove::List);
             }
             s.goto.selected = Some(match (s.goto.selected, delta > 0) {
                 (None, true) => 0,
@@ -1950,28 +2210,36 @@ pub fn prompt_move(delta: isize) -> bool {
                 (Some(i), true) => (i + 1).min(count - 1),
                 (Some(i), false) => i.saturating_sub(1),
             });
-            return Some(true);
+            return Some(if s.prompt_place == PromptPlace::Panel {
+                PromptMove::Panel
+            } else {
+                PromptMove::Location
+            });
         }
         if s.prompt != Some(PromptMode::Filter) {
             return None;
         }
         s.pane.move_cursor(delta);
-        Some(false)
+        Some(PromptMove::List)
     })
     .flatten();
+    let Some(moved) = moved else {
+        return false;
+    };
     match moved {
-        Some(true) => {
+        PromptMove::Panel => {
             if let Some(panel) = with_ref(|s| s.ui.goto.clone()) {
                 panel.setNeedsDisplay(true);
             }
-            true
         }
-        Some(false) => {
-            sync_ui();
-            true
+        PromptMove::Location => {
+            if let Some(list) = with_ref(|s| s.ui.location.clone()) {
+                list.setNeedsDisplay(true);
+            }
         }
-        None => false,
+        PromptMove::List => sync_ui(),
     }
+    true
 }
 
 /// Splits the "go to" text into the folder part as typed, the name prefix,
@@ -2016,26 +2284,36 @@ fn goto_query(text: String) {
 
 fn goto_matches_arrived(id: u64, dir_text: String, names: Vec<String>) {
     let ui = with(|s| {
-        if s.goto.query != id || s.prompt != Some(PromptMode::Goto) {
+        if s.goto.query != id || !s.goto_active() {
             return None;
         }
         s.goto.dir_text = dir_text;
         s.goto.matches = names;
         s.goto.selected = None;
-        Some((s.ui.clone(), s.goto.matches.len()))
+        Some((
+            s.ui.clone(),
+            s.goto.matches.len(),
+            s.prompt_place == PromptPlace::Panel,
+        ))
     })
     .flatten();
-    if let Some((ui, count)) = ui {
-        ui.root.set_goto(Some(crate::goto_panel::height(count)));
-        ui.goto.setNeedsDisplay(true);
+    match ui {
+        Some((ui, count, true)) => {
+            ui.root.set_goto(Some(crate::goto_panel::height(count)));
+            ui.goto.setNeedsDisplay(true);
+        }
+        // The location field: `sync_ui` shows the match list.
+        Some((_, _, false)) => sync_ui(),
+        None => {}
     }
 }
 
-/// Tab in the "go to" prompt completes the directory name. The directory
-/// read runs on a background thread.
+/// Tab in the "go to" panel and in the location field completes the
+/// directory name: the selected match, or the longest common prefix of the
+/// matches. The directory read runs on a background thread.
 pub fn prompt_complete(text: String) -> bool {
     let info = with_ref(|s| {
-        (s.prompt == Some(PromptMode::Goto)).then(|| {
+        s.goto_active().then(|| {
             let selected = s
                 .goto
                 .selected
@@ -2108,7 +2386,7 @@ fn complete_name(names: &[String], prefix: &str) -> Option<String> {
 }
 
 fn prompt_complete_result(original: String, new_text: String) {
-    if with_ref(|s| s.prompt == Some(PromptMode::Goto)) != Some(true) {
+    if with_ref(AppState::goto_active) != Some(true) {
         return;
     }
     let Some(field) = prompt_field() else {
@@ -2219,6 +2497,7 @@ pub fn appearance_changed() {
     if theme::is_dark(&appearance) == was_dark {
         return;
     }
+    icons::clear_rasters();
     let updated = with(|s| {
         let (style, _) = theme::style_for(&s.config, &appearance);
         s.style = style.clone();
@@ -2269,6 +2548,17 @@ struct UiPlan {
     metrics: Option<(usize, f64)>,
     redraw: Redraw,
     scroll_to: Option<usize>,
+    /// A page action: scroll the list, with an animation when it is on.
+    list_scroll: Option<ListScroll>,
+    scroll_time: Option<Duration>,
+    /// The cursor or the content changed without a page action: a smooth
+    /// scroll ends at its target first.
+    finish_scroll: bool,
+    /// The match list of the location field changed: show it at this place
+    /// with this number of rows, or hide it (`None`).
+    location: Option<Option<(PromptPlace, usize)>>,
+    /// Redraw the match list of the location field.
+    location_redraw: bool,
     /// The title, the directory, and true when it is on a local volume.
     title: Option<(String, PathBuf, bool)>,
     quick_look_reload: bool,
@@ -2287,12 +2577,24 @@ impl AppState {
         let cursor_changed = r.cursor != cursor;
         let redraw = if self.content_dirty || layout_changed {
             Redraw::All
-        } else if cursor_changed {
+        } else if cursor_changed && self.scroll_plan.is_none() {
             Redraw::Rows(r.cursor, cursor)
         } else {
             Redraw::None
         };
-        let scroll_to = (self.reveal_cursor || dir_changed || cursor_changed).then_some(cursor);
+        let list_scroll = self.scroll_plan.take();
+        let finish_scroll =
+            list_scroll.is_none() && (cursor_changed || self.content_dirty || layout_changed);
+        let scroll_to = (list_scroll.is_none()
+            && (self.reveal_cursor || dir_changed || cursor_changed))
+            .then_some(cursor);
+        let location = self.location_active().then(|| {
+            (
+                self.prompt_place,
+                self.goto.matches.len().min(crate::goto_panel::MAX_MATCHES),
+            )
+        });
+        let location_changed = !r.valid || r.location != location;
         let title = dir_changed.then(|| (display_path(&cwd), cwd.clone(), self.cwd_is_local));
         let quick_look_reload = dir_changed || r.current != current;
         let history = (self.pane.can_go_back(), self.pane.can_go_forward());
@@ -2337,6 +2639,7 @@ impl AppState {
             row_height,
             history,
             sort: Some(sort),
+            location,
         };
         UiPlan {
             ui: self.ui.clone(),
@@ -2353,6 +2656,11 @@ impl AppState {
             metrics: layout_changed.then_some((len, row_height)),
             redraw,
             scroll_to,
+            list_scroll,
+            scroll_time: self.config.smooth_scroll_time(),
+            finish_scroll,
+            location: location_changed.then_some(location),
+            location_redraw: location.is_some(),
             title,
             quick_look_reload,
         }
@@ -2361,6 +2669,9 @@ impl AppState {
 
 impl UiPlan {
     fn apply(self) {
+        if self.finish_scroll {
+            smooth::finish();
+        }
         if let Some((rows, row_height)) = self.metrics {
             self.list.set_metrics(rows, row_height);
         }
@@ -2372,8 +2683,26 @@ impl UiPlan {
             }
             Redraw::None => {}
         }
+        if let Some(plan) = self.list_scroll {
+            smooth::scroll_list(&self.list, &self.ui.scroll, plan, self.scroll_time);
+        }
         if let Some(row) = self.scroll_to {
             self.list.scroll_to_row(row);
+        }
+        if let Some(location) = self.location {
+            match location {
+                Some((place, count)) => {
+                    let anchor = place_field(&self.ui, place)
+                        .map(|f| Retained::into_super(Retained::into_super(f)));
+                    self.ui
+                        .root
+                        .set_location(anchor, crate::goto_panel::list_height(count));
+                }
+                None => self.ui.root.set_location(None, 0.0),
+            }
+        }
+        if self.location_redraw {
+            self.ui.location.setNeedsDisplay(true);
         }
         self.status.setNeedsDisplay(true);
         if self.redraw_header {

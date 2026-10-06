@@ -234,7 +234,10 @@ static CATALOG: &[(&str, &str)] = &[
     ("goto_prompt", "Show the go to folder prompt."),
     ("quick_look", "Show or hide the Quick Look panel."),
     ("toggle_hidden", "Show or hide hidden entries."),
-    ("filter", "Focus the filter field."),
+    (
+        "filter",
+        "Focus the filter field. A path in the field goes to a folder.",
+    ),
     ("cancel", "Cancel the most recent mode."),
     (
         "sort:<key>",

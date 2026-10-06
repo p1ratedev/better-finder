@@ -1,16 +1,23 @@
 //! The key binding help overlay: all bindings from `Keymap::bindings()`,
-//! grouped by action. `Escape` or `?` closes it.
+//! grouped by action.
+//!
+//! The overlay takes the keyboard focus while it is open. Its keys go
+//! through the user keymap (`app::handle_key` sends them to `app::help_key`):
+//! the movement actions scroll it, and `cancel`, `help`, and `q` close it.
 
 use std::cell::Cell;
 
 use bf_core::{Action, Keymap};
 use objc2::rc::Retained;
 use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send};
-use objc2_app_kit::{NSBezierPath, NSBorderType, NSEvent, NSResponder, NSScrollView, NSView};
+use objc2_app_kit::{
+    NSBezierPath, NSBorderType, NSEvent, NSEventModifierFlags, NSResponder, NSScrollView, NSView,
+};
 use objc2_foundation::{MainThreadMarker, NSObject, NSPoint, NSRect, NSSize};
 
 use crate::app::{self, AppState};
-use crate::list_view::draw_text;
+use crate::list_view::{self, draw_text};
+use crate::smooth;
 use crate::theme::{self, Style};
 
 const PAD: f64 = 22.0;
@@ -32,6 +39,8 @@ pub struct HelpLine {
 #[derive(Debug, Clone)]
 pub struct HelpModel {
     pub lines: Vec<HelpLine>,
+    /// The keys at the top right, from the keymap: `j k scroll · q escape ? close`.
+    pub hint: String,
     pub key_width: f64,
     pub action_width: f64,
 }
@@ -76,6 +85,7 @@ impl HelpModel {
             .ceil()
             .min(240.0);
         HelpModel {
+            hint: hint(&lines),
             lines,
             key_width,
             action_width,
@@ -113,10 +123,35 @@ define_class!(
             true
         }
 
+        #[unsafe(method(acceptsFirstResponder))]
+        fn accepts_first_responder(&self) -> bool {
+            true
+        }
+
         #[unsafe(method(drawRect:))]
-        fn draw_rect(&self, _dirty: NSRect) {
+        fn draw_rect(&self, dirty: NSRect) {
+            let started = std::time::Instant::now();
             let bounds = self.bounds();
-            app::with_ref(|s| draw(s, bounds));
+            app::with_ref(|s| draw(s, bounds, dirty));
+            smooth::note_draw(started.elapsed());
+        }
+
+        #[unsafe(method(keyDown:))]
+        fn key_down(&self, event: &NSEvent) {
+            list_view::handle_ns_key(event);
+        }
+
+        #[unsafe(method(performKeyEquivalent:))]
+        fn perform_key_equivalent(&self, event: &NSEvent) -> bool {
+            self.key_equivalent(event)
+        }
+
+        #[unsafe(method(scrollWheel:))]
+        fn scroll_wheel(&self, event: &NSEvent) {
+            // A mouse scroll ends a smooth scroll at its target.
+            smooth::finish();
+            // SAFETY: NSResponder implements this method with this signature.
+            let _: () = unsafe { msg_send![super(self), scrollWheel: event] };
         }
 
         #[unsafe(method(mouseDown:))]
@@ -141,6 +176,27 @@ impl HelpView {
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(100.0, 100.0));
         // SAFETY: `initWithFrame:` is the designated initializer of NSView.
         unsafe { msg_send![super(this), initWithFrame: frame] }
+    }
+
+    /// Keys with `cmd` go to the keymap only when the overlay has the
+    /// focus. A false result lets the main menu handle the key.
+    fn key_equivalent(&self, event: &NSEvent) -> bool {
+        if !event
+            .modifierFlags()
+            .contains(NSEventModifierFlags::Command)
+        {
+            return false;
+        }
+        let first = self
+            .window()
+            .and_then(|w| w.firstResponder())
+            .is_some_and(|r| {
+                std::ptr::eq(
+                    Retained::as_ptr(&r).cast::<u8>(),
+                    (self as *const Self).cast::<u8>(),
+                )
+            });
+        first && list_view::handle_ns_key(event)
     }
 
     /// Sets the content height and updates the frame.
@@ -175,14 +231,46 @@ pub fn create(mtm: MainThreadMarker) -> HelpUi {
     scroll.setAutohidesScrollers(true);
     scroll.setDrawsBackground(false);
     scroll.setBorderType(NSBorderType::NoBorder);
+    // The overlay is below the toolbar: no automatic insets, so that the
+    // scroll range starts at 0.
+    scroll.setAutomaticallyAdjustsContentInsets(false);
     let view = HelpView::new(mtm);
     scroll.setDocumentView(Some(&view));
     scroll.setHidden(true);
     HelpUi { scroll, view }
 }
 
-fn draw(s: &AppState, bounds: NSRect) {
+/// The hint text: one key of each scroll action and of each close action,
+/// from the keymap. `q` always closes the overlay.
+fn hint(lines: &[HelpLine]) -> String {
+    // The shortest key of the action: `j` before `down`.
+    let first_key = |action: &str| {
+        lines
+            .iter()
+            .find(|l| l.action == action)
+            .and_then(|l| l.keys.split("  ").min_by_key(|k| k.chars().count()))
+            .map(str::to_string)
+    };
+    let scroll: Vec<String> = ["cursor_down", "cursor_up", "half_page_down", "half_page_up"]
+        .iter()
+        .filter_map(|a| first_key(a))
+        .collect();
+    let mut close = vec!["q".to_string()];
+    close.extend(["cancel", "help"].iter().filter_map(|a| first_key(a)));
+    close.dedup();
+    if scroll.is_empty() {
+        format!("{} close", close.join(" "))
+    } else {
+        format!("{} scroll · {} close", scroll.join(" "), close.join(" "))
+    }
+}
+
+/// Draws the overlay. Only the lines in `dirty` draw text: a scroll shows
+/// a strip of a few lines.
+fn draw(s: &AppState, bounds: NSRect, dirty: NSRect) {
     let Some(model) = &s.help else { return };
+    let in_dirty =
+        |y: f64, height: f64| y < dirty.origin.y + dirty.size.height && y + height > dirty.origin.y;
     let st = &s.style;
     // Dim the list under the overlay.
     st.colors.list_bg.colorWithAlphaComponent(0.85).setFill();
@@ -205,24 +293,18 @@ fn draw(s: &AppState, bounds: NSRect) {
     let top = MARGIN + PAD;
     let right = left + panel_w - PAD;
     let text_dy = ((h - line) / 2.0).round();
-    let title_rect = NSRect::new(
-        NSPoint::new(left + PAD, top + text_dy),
-        NSSize::new(panel_w / 2.0, line + 4.0),
-    );
-    draw_text("Key bindings", title_rect, &st.help_title);
-    let hint = "Escape or ? closes this list";
-    let hint_w = theme::text_width(hint, &st.help_desc).ceil() + 1.0;
-    let hint_rect = NSRect::new(
-        NSPoint::new(right - hint_w, top + text_dy),
-        NSSize::new(hint_w, line),
-    );
-    draw_text(hint, hint_rect, &st.help_desc);
+    if in_dirty(top, h) {
+        draw_title(model, st, (left, right, top + text_dy, panel_w));
+    }
 
     let key_x = left + PAD;
     let action_x = key_x + model.key_width + GAP;
     let desc_x = action_x + model.action_width + GAP;
     for (i, item) in model.lines.iter().enumerate() {
         let y = top + h * (i as f64 + 1.5) + text_dy;
+        if !in_dirty(y, line) {
+            continue;
+        }
         let rect = |x: f64, w: f64| NSRect::new(NSPoint::new(x, y), NSSize::new(w.max(0.0), line));
         draw_text(&item.keys, rect(key_x, model.key_width), &st.help_key);
         draw_text(
@@ -236,4 +318,19 @@ fn draw(s: &AppState, bounds: NSRect) {
             &st.help_desc,
         );
     }
+}
+
+/// The title on the left and the key hint on the right. `(left, right, y,
+/// panel_w)`: the text edges, the text top, and the panel width.
+fn draw_title(model: &HelpModel, st: &Style, (left, right, y, panel_w): (f64, f64, f64, f64)) {
+    let line = st.line_height;
+    let title_rect = NSRect::new(
+        NSPoint::new(left + PAD, y),
+        NSSize::new(panel_w / 2.0, line + 4.0),
+    );
+    draw_text("Key bindings", title_rect, &st.help_title);
+    let hint = model.hint.as_str();
+    let hint_w = (theme::text_width(hint, &st.help_desc).ceil() + 1.0).min(panel_w / 2.0);
+    let hint_rect = NSRect::new(NSPoint::new(right - hint_w, y), NSSize::new(hint_w, line));
+    draw_text(hint, hint_rect, &st.help_desc);
 }

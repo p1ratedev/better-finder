@@ -8,17 +8,23 @@
 //! - It handles the mouse.
 //! - It is the controller of the Quick Look panel (it is in the responder chain).
 //! - It hosts the inline rename field.
+//! - During a smooth scroll, a small subview (`HighlightView`) shows the
+//!   cursor highlight at the animated position, and the list draws no
+//!   cursor row. The subview fills the highlight and draws the rows under
+//!   it again in the selection colors, clipped to the highlight. So the
+//!   text under the moving highlight stays readable, and a frame redraws
+//!   only the subview and the rows that the scroll shows.
 
-use std::cell::Cell;
+use std::cell::{Cell, OnceCell};
 use std::time::{Instant, SystemTime};
 
 use bf_core::keymap::{Key, Mods, NamedKey};
+use bf_core::viewport::Viewport;
 use bf_core::{Entry, KeyEvent};
 use objc2::rc::Retained;
 use objc2::{ClassType, DefinedClass, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
-    NSBezierPath, NSCompositingOperation, NSEvent, NSEventModifierFlags, NSResponder,
-    NSStringDrawing, NSView,
+    NSBezierPath, NSEvent, NSEventModifierFlags, NSResponder, NSStringDrawing, NSView,
 };
 use objc2_foundation::{MainThreadMarker, NSObject, NSPoint, NSRect, NSSize, NSString};
 use objc2_quick_look_ui::QLPreviewPanel;
@@ -28,11 +34,27 @@ use crate::columns;
 use crate::debug::trace;
 use crate::icons;
 use crate::quicklook;
+use crate::smooth;
 use crate::theme::{
     Attrs, ColumnLayout, LEFT_PAD, RowState, SELECTION_INSET, SELECTION_RADIUS, Style,
 };
 
+/// The view of the list in rows.
+#[derive(Clone, Copy, Debug)]
+pub struct ViewRows {
+    /// The first visible row below the covered top. It is a fraction of a
+    /// row after a mouse scroll.
+    pub top: f64,
+    /// The visible height below the covered top, in rows.
+    pub height: f64,
+    pub row_height: f64,
+    /// The height that the toolbar and the column header cover.
+    pub inset: f64,
+}
+
 pub struct ListIvars {
+    /// The cursor highlight during a smooth scroll. Made at the first use.
+    highlight: OnceCell<Retained<HighlightView>>,
     row_height: Cell<f64>,
     rows: Cell<usize>,
     /// The height at the top that the toolbar and the column header cover.
@@ -109,6 +131,8 @@ define_class!(
 
         #[unsafe(method(scrollWheel:))]
         fn scroll_wheel(&self, event: &NSEvent) {
+            // A mouse scroll ends a smooth scroll at its target.
+            smooth::finish();
             // A scroll cancels the inline rename, like in Finder.
             app::after_now(app::cancel_inline_rename);
             // SAFETY: NSResponder implements this method with this signature.
@@ -117,9 +141,7 @@ define_class!(
 
         #[unsafe(method(resizeWithOldSuperviewSize:))]
         fn resize_with_old_superview_size(&self, old: NSSize) {
-            // SAFETY: NSView implements this method with this signature.
-            let _: () = unsafe { msg_send![super(self), resizeWithOldSuperviewSize: old] };
-            self.update_frame();
+            self.superview_resized(old);
         }
 
         #[unsafe(method(acceptsPreviewPanelControl:))]
@@ -139,9 +161,59 @@ define_class!(
     }
 );
 
+pub struct HighlightIvars {
+    /// The list has the focus in the key window: the active color.
+    active: Cell<bool>,
+}
+
+define_class!(
+    // SAFETY:
+    // - NSView has no subclass requirements.
+    // - HighlightView does not implement Drop.
+    #[unsafe(super(NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "BFHighlightView"]
+    #[ivars = HighlightIvars]
+    pub struct HighlightView;
+
+    impl HighlightView {
+        #[unsafe(method(isFlipped))]
+        fn is_flipped(&self) -> bool {
+            true
+        }
+
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: NSRect) {
+            let started = Instant::now();
+            let bounds = self.bounds();
+            let active = self.ivars().active.get();
+            let scale = self.window().map_or(2.0, |w| w.backingScaleFactor());
+            let rows = app::with_ref(|s| draw_highlight(s, bounds, active, scale));
+            smooth::note_draw(started.elapsed());
+            trace!(
+                "draw: highlight, {} rows in {} µs",
+                rows.unwrap_or(0),
+                started.elapsed().as_micros()
+            );
+        }
+    }
+);
+
+impl HighlightView {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(HighlightIvars {
+            active: Cell::new(true),
+        });
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(100.0, 20.0));
+        // SAFETY: `initWithFrame:` is the designated initializer of NSView.
+        unsafe { msg_send![super(this), initWithFrame: frame] }
+    }
+}
+
 impl ListView {
     pub fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(ListIvars {
+            highlight: OnceCell::new(),
             row_height: Cell::new(20.0),
             rows: Cell::new(0),
             inset_top: Cell::new(0.0),
@@ -159,6 +231,73 @@ impl ListView {
         self.ivars().rows.set(rows);
         self.ivars().row_height.set(row_height);
         self.update_frame();
+    }
+
+    /// The clip view changed its size (a window resize, or a bar that shows
+    /// or hides). A smooth scroll ends at its target.
+    fn superview_resized(&self, old: NSSize) {
+        // SAFETY: The superview is the clip view, which retains this view.
+        let changed = unsafe { self.superview() }.is_some_and(|clip| clip.bounds().size != old);
+        if changed {
+            smooth::finish();
+        }
+        // SAFETY: NSView implements this method with this signature.
+        let _: () = unsafe { msg_send![super(self), resizeWithOldSuperviewSize: old] };
+        self.update_frame();
+    }
+
+    /// The view in rows. See `ViewRows`.
+    pub fn view_rows(&self) -> Option<ViewRows> {
+        let scroll = self.enclosingScrollView()?;
+        let bounds = scroll.contentView().bounds();
+        let iv = self.ivars();
+        let (h, inset) = (iv.row_height.get(), iv.inset_top.get());
+        if h <= 0.0 {
+            return None;
+        }
+        Some(ViewRows {
+            top: (bounds.origin.y + inset) / h,
+            height: ((bounds.size.height - inset) / h).max(0.0),
+            row_height: h,
+            inset,
+        })
+    }
+
+    /// Shows the cursor highlight of a smooth scroll at `y` (document
+    /// coordinates), or hides it (`None`). Only the highlight view redraws:
+    /// the move of a subview does not redraw the list.
+    pub fn show_highlight(&self, y: Option<f64>) {
+        let Some(y) = y else {
+            if let Some(view) = self.ivars().highlight.get() {
+                if !view.isHidden() {
+                    view.setHidden(true);
+                }
+            }
+            return;
+        };
+        let view = self.ivars().highlight.get_or_init(|| {
+            let view = HighlightView::new(self.mtm());
+            self.addSubview(&view);
+            view
+        });
+        let h = self.ivars().row_height.get();
+        let width = self.bounds().size.width;
+        view.ivars().active.set(self.is_active());
+        view.setFrame(NSRect::new(NSPoint::new(0.0, y), NSSize::new(width, h)));
+        // The bounds use the document coordinates of the list, so the rows
+        // draw at their own y.
+        view.setBoundsOrigin(NSPoint::new(0.0, y));
+        view.setHidden(false);
+        view.setNeedsDisplay(true);
+    }
+
+    /// Redraws the band of one row height at `y` (document coordinates).
+    pub fn redraw_band(&self, y: f64, height: f64) {
+        let width = self.bounds().size.width;
+        self.setNeedsDisplayInRect(NSRect::new(
+            NSPoint::new(0.0, y),
+            NSSize::new(width, height),
+        ));
     }
 
     /// Sets the height at the top that other views cover.
@@ -213,33 +352,29 @@ impl ListView {
     }
 
     /// Scrolls so that `row` is visible below the covered top, with a
-    /// margin of 2 rows.
+    /// margin of 2 rows (`Viewport::reveal`).
     pub fn scroll_to_row(&self, row: usize) {
         let Some(scroll) = self.enclosingScrollView() else {
             return;
         };
+        let Some(view) = self.view_rows() else {
+            return;
+        };
         let clip = scroll.contentView();
         let bounds = clip.bounds();
-        let iv = self.ivars();
-        let (rows, h, inset) = (iv.rows.get(), iv.row_height.get(), iv.inset_top.get());
-        let free_height = bounds.size.height - inset;
-        let mut y = bounds.origin.y;
-        if rows == 0 {
-            y = -inset;
-        } else {
-            let row = row.min(rows - 1) as f64;
-            let margin = if free_height >= 5.0 * h { 2.0 * h } else { 0.0 };
-            let top = row * h - margin;
-            let bottom = (row + 1.0) * h + margin;
-            if top < bounds.origin.y + inset {
-                y = top - inset;
-            } else if bottom > bounds.origin.y + bounds.size.height {
-                y = bottom - bounds.size.height;
-            }
+        let (h, inset) = (view.row_height, view.inset);
+        let viewport = Viewport {
+            len: self.ivars().rows.get(),
+            height: view.height,
+        };
+        let top = view.top;
+        let new_top = viewport.reveal(top, row);
+        if (new_top - top).abs() < 1e-6 {
+            return;
         }
         let max_y = (self.frame().size.height - bounds.size.height).max(-inset);
-        let y = y.clamp(-inset, max_y);
-        if y != bounds.origin.y {
+        let y = (new_top * h - inset).clamp(-inset, max_y);
+        if (y - bounds.origin.y).abs() > 0.001 {
             clip.scrollToPoint(NSPoint::new(bounds.origin.x, y));
             scroll.reflectScrolledClipView(&clip);
         }
@@ -313,8 +448,18 @@ impl ListView {
         let started = Instant::now();
         let bounds = self.bounds();
         let free = self.free_rect();
-        let active = self.is_active();
-        let drawn = app::with_ref(|s| draw_list(s, bounds, free, dirty, active)).flatten();
+        let needs = |rect| self.needsToDrawRect(rect);
+        let input = ListDraw {
+            bounds,
+            free,
+            dirty,
+            active: self.is_active(),
+            animating: smooth::list_highlight().is_some(),
+            scale: self.window().map_or(2.0, |w| w.backingScaleFactor()),
+            needs: &needs,
+        };
+        let drawn = app::with_ref(|s| draw_list(s, &input)).flatten();
+        smooth::note_draw(started.elapsed());
         let Some(rows) = drawn else { return };
         // The draw put paths in the icon queue. Get their icons after the frame.
         icons::schedule_resolve();
@@ -417,15 +562,35 @@ fn named_key(code: u16) -> Option<NamedKey> {
     })
 }
 
-/// Draws the rows in `dirty`. Returns the number of rows, or `None` before
-/// the first load. `free` is the visible part below the covered top.
-fn draw_list(
-    s: &AppState,
+/// The inputs of one draw of the list.
+struct ListDraw<'a> {
     bounds: NSRect,
+    /// The visible part below the covered top.
     free: NSRect,
     dirty: NSRect,
+    /// The list has the focus in the key window.
     active: bool,
-) -> Option<usize> {
+    /// A smooth scroll runs: the highlight view shows the cursor.
+    animating: bool,
+    /// The backing scale factor, for the icon bitmaps.
+    scale: f64,
+    /// `needsToDrawRect:`. The dirty region can be smaller than the `dirty`
+    /// rect (for example the highlight and the strip that a scroll shows).
+    needs: &'a dyn Fn(NSRect) -> bool,
+}
+
+/// Draws the rows in the dirty region. Returns the number of rows, or
+/// `None` before the first load.
+fn draw_list(s: &AppState, input: &ListDraw<'_>) -> Option<usize> {
+    let ListDraw {
+        bounds,
+        free,
+        dirty,
+        active,
+        animating,
+        scale,
+        needs,
+    } = *input;
     if !s.pane.is_loaded() {
         return None;
     }
@@ -461,15 +626,95 @@ fn draw_list(
         } else {
             RowState::SelectedInactive
         },
+        scale,
     };
-    let cursor = s.pane.cursor();
+    let row_rect =
+        |row: usize| NSRect::new(NSPoint::new(0.0, row as f64 * h), NSSize::new(width, h));
+    // During a smooth scroll, the highlight view shows the cursor, and all
+    // rows draw in the normal colors.
+    let cursor = (!animating).then(|| s.pane.cursor());
+    let mut drawn = 0;
     for row in first..end {
+        if !needs(row_rect(row)) {
+            continue;
+        }
         let Some(entry) = s.pane.visible_entry(row) else {
             break;
         };
-        draw_row(&frame, entry, row, row == cursor);
+        draw_row(&frame, entry, row, cursor == Some(row));
+        drawn += 1;
     }
-    Some(end.saturating_sub(first))
+    Some(drawn)
+}
+
+/// Draws the cursor highlight of a smooth scroll: `bounds` is the frame of
+/// the highlight view in the document coordinates of the list. It fills the
+/// highlight and draws the rows under it in the selection colors, clipped
+/// to the highlight. Returns the number of rows.
+fn draw_highlight(s: &AppState, bounds: NSRect, active: bool, scale: f64) -> usize {
+    if !s.pane.is_loaded() {
+        return 0;
+    }
+    let st = &s.style;
+    let h = st.row_height;
+    let width = bounds.size.width;
+    let layout = st.layout(width);
+    let frame = RowFrame {
+        st,
+        width,
+        layout: &layout,
+        now: SystemTime::now(),
+        path_icons: s.cwd_is_local(),
+        cursor_state: if active {
+            RowState::Selected
+        } else {
+            RowState::SelectedInactive
+        },
+        scale,
+    };
+    let y = bounds.origin.y;
+    let rect = highlight_rect(width, y, h);
+    NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+        rect,
+        SELECTION_RADIUS,
+        SELECTION_RADIUS,
+    )
+    .addClip();
+    fill_highlight(&frame, rect);
+    let len = s.pane.visible_len();
+    let top_row = (y / h).floor().max(0.0) as usize;
+    let bottom_row = (((y + h) / h).ceil().max(0.0) as usize).min(len);
+    let mut drawn = 0;
+    for row in top_row..bottom_row {
+        if let Some(entry) = s.pane.visible_entry(row) {
+            draw_row_content(&frame, entry, row, frame.cursor_state);
+            drawn += 1;
+        }
+    }
+    drawn
+}
+
+/// The rounded rectangle of the cursor highlight at `y`.
+fn highlight_rect(width: f64, y: f64, h: f64) -> NSRect {
+    NSRect::new(
+        NSPoint::new(SELECTION_INSET, y),
+        NSSize::new((width - 2.0 * SELECTION_INSET).max(0.0), h),
+    )
+}
+
+/// Fills the cursor highlight in the color of the cursor state.
+fn fill_highlight(frame: &RowFrame<'_>, rect: NSRect) {
+    let fill = match frame.cursor_state {
+        RowState::Selected => &frame.st.colors.selection_bg,
+        _ => &frame.st.colors.selection_bg_inactive,
+    };
+    fill.setFill();
+    NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+        rect,
+        SELECTION_RADIUS,
+        SELECTION_RADIUS,
+    )
+    .fill();
 }
 
 /// The values that are the same for all rows of one draw.
@@ -482,41 +727,32 @@ struct RowFrame<'a> {
     path_icons: bool,
     /// The state of the cursor row.
     cursor_state: RowState,
+    /// The backing scale factor of the window, for the icon bitmaps.
+    scale: f64,
 }
 
 fn draw_row(frame: &RowFrame<'_>, entry: &Entry, row: usize, is_cursor: bool) {
+    let h = frame.st.row_height;
+    let y = row as f64 * h;
+    if is_cursor {
+        fill_highlight(frame, highlight_rect(frame.width, y, h));
+        draw_row_content(frame, entry, row, frame.cursor_state);
+    } else {
+        draw_row_content(frame, entry, row, RowState::Normal);
+    }
+}
+
+/// Draws the icon and the text of one row, without a background.
+fn draw_row_content(frame: &RowFrame<'_>, entry: &Entry, row: usize, state: RowState) {
     let RowFrame {
         st,
-        width,
         layout,
         now,
         path_icons,
-        cursor_state,
+        ..
     } = *frame;
     let h = st.row_height;
     let y = row as f64 * h;
-    let state = if is_cursor {
-        cursor_state
-    } else {
-        RowState::Normal
-    };
-    if is_cursor {
-        let fill = match state {
-            RowState::Selected => &st.colors.selection_bg,
-            _ => &st.colors.selection_bg_inactive,
-        };
-        fill.setFill();
-        let rect = NSRect::new(
-            NSPoint::new(SELECTION_INSET, y),
-            NSSize::new((width - 2.0 * SELECTION_INSET).max(0.0), h),
-        );
-        NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
-            rect,
-            SELECTION_RADIUS,
-            SELECTION_RADIUS,
-        )
-        .fill();
-    }
     if st.show_icons {
         if let Some(icon) = icons::icon_for(entry, path_icons) {
             let size = st.icon_size;
@@ -525,18 +761,7 @@ fn draw_row(frame: &RowFrame<'_>, entry: &Entry, row: usize, is_cursor: bool) {
                 NSSize::new(size, size),
             );
             let alpha = if entry.hidden { 0.5 } else { 1.0 };
-            // SAFETY: A `None` hints dictionary is valid. The view is flipped,
-            // so `respectFlipped` must be true.
-            unsafe {
-                icon.drawInRect_fromRect_operation_fraction_respectFlipped_hints(
-                    rect,
-                    NSRect::ZERO,
-                    NSCompositingOperation::SourceOver,
-                    alpha,
-                    true,
-                    None,
-                );
-            }
+            icons::draw_icon(&icon, rect, alpha, frame.scale);
         }
     }
     let attrs = st.row(state);

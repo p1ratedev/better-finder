@@ -6,6 +6,9 @@
 //! - `Up` and `Down` select a match. `Enter` goes to the selected match, or
 //!   to the text.
 //! - A background thread lists the matches (a directory read).
+//!
+//! The same view without a field (`create_list`) is the match list of the
+//! location field: the filter field with a path.
 
 use std::cell::OnceCell;
 
@@ -28,6 +31,8 @@ pub const MAX_MATCHES: usize = 8;
 pub const FIELD_HEIGHT: f64 = 44.0;
 pub const ROW_HEIGHT: f64 = 24.0;
 const PAD: f64 = 12.0;
+/// The x of the text in the field and in the match rows.
+pub const TEXT_X: f64 = PAD + 26.0;
 const RADIUS: f64 = 12.0;
 
 #[derive(Default)]
@@ -54,7 +59,8 @@ define_class!(
         #[unsafe(method(drawRect:))]
         fn draw_rect(&self, _dirty: NSRect) {
             let bounds = self.bounds();
-            app::with_ref(|s| draw(s, bounds));
+            let with_field = self.field().is_some();
+            app::with_ref(|s| draw(s, bounds, with_field));
         }
 
         #[unsafe(method(resizeSubviewsWithOldSize:))]
@@ -75,7 +81,7 @@ impl GotoPanel {
         };
         let width = self.bounds().size.width;
         let field_h = field.intrinsicContentSize().height.ceil().max(18.0);
-        let x = PAD + 26.0;
+        let x = TEXT_X;
         field.setFrame(NSRect::new(
             NSPoint::new(x, ((FIELD_HEIGHT - field_h) / 2.0).round()),
             NSSize::new((width - x - PAD).max(0.0), field_h),
@@ -107,6 +113,27 @@ pub fn create(mtm: MainThreadMarker, delegate: &Retained<PromptDelegate>) -> Ret
     panel
 }
 
+/// Makes the match list of the location field (hidden): the panel without
+/// a field.
+pub fn create_list(mtm: MainThreadMarker) -> Retained<GotoPanel> {
+    let list: Retained<GotoPanel> = {
+        let this = GotoPanel::alloc(mtm).set_ivars(PanelIvars::default());
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(320.0, ROW_HEIGHT));
+        // SAFETY: `initWithFrame:` is the designated initializer of NSView.
+        unsafe { msg_send![super(this), initWithFrame: frame] }
+    };
+    list.setHidden(true);
+    list
+}
+
+/// The height of the match list for `count` matches. 0 hides the list.
+pub fn list_height(count: usize) -> f64 {
+    match count.min(MAX_MATCHES) {
+        0 => 0.0,
+        rows => rows as f64 * ROW_HEIGHT + 8.0,
+    }
+}
+
 /// The panel height for `count` matches.
 pub fn height(count: usize) -> f64 {
     let rows = count.min(MAX_MATCHES) as f64;
@@ -118,7 +145,9 @@ pub fn height(count: usize) -> f64 {
         }
 }
 
-fn draw(s: &AppState, bounds: NSRect) {
+/// Draws the panel. `with_field`: the "go to" panel (the field on top);
+/// else the match list of the location field.
+fn draw(s: &AppState, bounds: NSRect, with_field: bool) {
     let st = &s.style;
     let panel = NSRect::new(
         NSPoint::new(0.5, 0.5),
@@ -129,25 +158,30 @@ fn draw(s: &AppState, bounds: NSRect) {
     path.fill();
     st.colors.separator.setStroke();
     path.stroke();
-    let icon_rect = NSRect::new(
-        NSPoint::new(PAD, ((FIELD_HEIGHT - 18.0) / 2.0).round()),
-        NSSize::new(18.0, 18.0),
-    );
-    if let Some(icon) = icons::folder_icon() {
-        icons::draw_in(&icon, icon_rect);
-    }
     let goto = s.goto_matches();
-    if goto.0.is_empty() {
-        return;
-    }
-    st.colors.separator.setFill();
-    NSBezierPath::fillRect(NSRect::new(
-        NSPoint::new(0.0, FIELD_HEIGHT),
-        NSSize::new(bounds.size.width, 1.0),
-    ));
+    let rows_top = if with_field {
+        let icon_rect = NSRect::new(
+            NSPoint::new(PAD, ((FIELD_HEIGHT - 18.0) / 2.0).round()),
+            NSSize::new(18.0, 18.0),
+        );
+        if let Some(icon) = icons::folder_icon() {
+            icons::draw_in(&icon, icon_rect);
+        }
+        if goto.0.is_empty() {
+            return;
+        }
+        st.colors.separator.setFill();
+        NSBezierPath::fillRect(NSRect::new(
+            NSPoint::new(0.0, FIELD_HEIGHT),
+            NSSize::new(bounds.size.width, 1.0),
+        ));
+        FIELD_HEIGHT
+    } else {
+        0.0
+    };
     let line = st.line_height;
     for (i, name) in goto.0.iter().take(MAX_MATCHES).enumerate() {
-        let y = FIELD_HEIGHT + 4.0 + i as f64 * ROW_HEIGHT;
+        let y = rows_top + 4.0 + i as f64 * ROW_HEIGHT;
         let selected = goto.1 == Some(i);
         if selected {
             st.colors.selection_bg.setFill();
@@ -171,7 +205,7 @@ fn draw(s: &AppState, bounds: NSRect) {
         } else {
             &st.normal.name
         };
-        let x = PAD + 26.0;
+        let x = TEXT_X;
         draw_text(
             name,
             NSRect::new(

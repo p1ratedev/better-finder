@@ -352,6 +352,8 @@ pub const DEFAULT_BINDINGS: &[&str] = &[
     "end=cursor_bottom",
     "ctrl+d=half_page_down",
     "ctrl+u=half_page_up",
+    "ctrl+f=page_down",
+    "ctrl+b=page_up",
     "page_down=page_down",
     "page_up=page_up",
     // Navigation
@@ -777,6 +779,42 @@ mod tests {
             KeyOutcome::Action(Action::Open)
         );
         assert_eq!(feed(&mut st, &map, ev('~')), KeyOutcome::Unbound);
+    }
+
+    #[test]
+    fn vim_page_keys() {
+        let map = Keymap::default();
+        let mut st = KeymapState::default();
+        let ctrl = |c: char| KeyEvent {
+            base: Key::Char(c),
+            shifted: None,
+            mods: Mods {
+                ctrl: true,
+                ..Mods::default()
+            },
+        };
+        let expected = [
+            ('d', Action::HalfPageDown),
+            ('u', Action::HalfPageUp),
+            ('f', Action::PageDown),
+            ('b', Action::PageUp),
+        ];
+        for (c, action) in expected {
+            assert_eq!(feed(&mut st, &map, ctrl(c)), KeyOutcome::Action(action));
+        }
+        // `cmd+f` stays the filter.
+        let cmd_f = KeyEvent {
+            base: Key::Char('f'),
+            shifted: None,
+            mods: Mods {
+                cmd: true,
+                ..Mods::default()
+            },
+        };
+        assert_eq!(
+            feed(&mut st, &map, cmd_f),
+            KeyOutcome::Action(Action::Filter)
+        );
     }
 
     #[test]

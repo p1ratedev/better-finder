@@ -34,6 +34,13 @@ impl fmt::Display for FilterMode {
     }
 }
 
+/// True when the text of the location and filter field is a path, not a
+/// filter: it starts with `~`, contains `/`, or is `.` or `..`. A path goes
+/// to a folder. Other text filters the current folder.
+pub fn is_path_query(text: &str) -> bool {
+    text.starts_with('~') || text.contains('/') || text == "." || text == ".."
+}
+
 /// Smart case: when `query` has no uppercase letter, the match ignores case.
 /// When `query` has an uppercase letter, the match is case-sensitive.
 /// An empty query matches all names.
@@ -95,6 +102,20 @@ mod tests {
         assert!(!matches(Fuzzy, "mdr", "readme.md"));
         assert!(matches(Fuzzy, "aa", "banana"));
         assert!(!matches(Fuzzy, "aaaa", "banana"));
+    }
+
+    #[test]
+    fn path_queries() {
+        for text in [
+            "~", "~/", "~/Doc", "/", "/tmp", "a/b", "src/", ".", "..", "../x",
+        ] {
+            assert!(is_path_query(text), "{text}");
+        }
+        for text in ["", "read", ".git", "...", "a.b", "x~", " "] {
+            assert!(!is_path_query(text), "{text}");
+        }
+        // A tilde starts a path, also without a slash (`~user` style).
+        assert!(is_path_query("~x"));
     }
 
     #[test]

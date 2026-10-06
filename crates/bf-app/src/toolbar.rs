@@ -10,7 +10,8 @@
 //! first frame: the start is faster and nothing moves.
 //!
 //! The filter field uses the same delegate as the bottom prompt, so `Enter`,
-//! `Escape`, `Up`, and `Down` work the same way.
+//! `Escape`, `Up`, and `Down` work the same way. It is also the location
+//! field: a path in it goes to a folder (see `app::prompt_changed`).
 
 use std::cell::OnceCell;
 
@@ -115,7 +116,7 @@ impl ToolbarController {
                     &NSString::from_str(SEARCH_ID),
                 );
                 let field = search.searchField();
-                field.setPlaceholderString(Some(&NSString::from_str("Filter")));
+                field.setPlaceholderString(Some(&NSString::from_str("Filter or go to a path")));
                 if let Some(delegate) = self.ivars().delegate.get() {
                     // SAFETY: The controller keeps the delegate alive as long
                     // as the field.

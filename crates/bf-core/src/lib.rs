@@ -15,6 +15,7 @@ pub mod fs;
 pub mod keymap;
 pub mod pane;
 pub mod sort;
+pub mod viewport;
 
 pub use action::Action;
 pub use color::Rgba;
