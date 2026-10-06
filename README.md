@@ -6,6 +6,9 @@ A fast, keyboard-first file explorer for macOS. It is written in Rust. You confi
 - **Keyboard first.** It has vim keys and Finder keys by default. You can bind any key or key sequence to any action.
 - **Configured with a dotfile.** One plain text file, `~/.config/better-finder/config`. The app reloads it without a restart.
 - **Native Quick Look.** Press `Space` to preview a file, like in Finder.
+- **Finder-style UI.** It has a glass sidebar with Favorites and Locations, and a toolbar with a Filter field. It has a column header with sort, a Kind column, and a path bar. The system theme follows the macOS accent color. Rename happens inline in the list.
+
+See [docs/UI.md](docs/UI.md) for the UI design contract.
 
 ## Build and run
 
@@ -28,18 +31,26 @@ The config file is `~/.config/better-finder/config`. If `XDG_CONFIG_HOME` is set
 # Look
 font-family = "JetBrains Mono"
 font-size = 14
-theme = auto
+# system follows the macOS colors; dark gives the custom palette
+theme = system
 background = #1e1e2e
 foreground = #cdd6f4
 selection-background = #45475a
 background-opacity = 0.95
 
+# Sidebar and bars
+sidebar = true
+sidebar-item = ~/Apps
+toolbar = true
+column-header = true
+path-bar = true
+
 # Behavior
 show-hidden = false
 sort-by = name
 directories-first = true
-columns = size,modified
-date-format = relative
+columns = size,kind,modified
+date-format = finder
 terminal = Ghostty
 
 # Keys
@@ -69,9 +80,13 @@ better-finder +validate-config         # check the config file for errors
 | `gg` `G` | Top and bottom |
 | `ctrl+d` `ctrl+u` | Half page down and up |
 | `Space` | Quick Look |
-| `/` | Filter |
+| `/`, `cmd+f` | Filter |
+| `Tab` | Focus the sidebar (`Tab` again gives the focus back to the list) |
+| `cmd+ctrl+s` | Show or hide the sidebar |
 | `.`, `cmd+shift+.` | Show or hide hidden files |
 | `gh` `gd` `ge` `go` `ga` `gc` `gr` | Go to home, Downloads, Desktop, Documents, Applications, `~/.config`, `/` |
+| `cmd+shift+h` `cmd+shift+d` `cmd+shift+o` `cmd+alt+l` | Finder go to: Home, Desktop, Documents, Downloads |
+| `cmd+shift+a` `cmd+shift+u` `cmd+shift+i` | Finder go to: Applications, Utilities, iCloud Drive |
 | `cmd+shift+g` | Go to a folder (prompt) |
 | `sn` `ss` `sm` `se` `sr` | Sort by name, size, date, extension; reverse the order |
 | `r` | Rename |

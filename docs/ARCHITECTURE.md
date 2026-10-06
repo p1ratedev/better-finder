@@ -21,6 +21,8 @@ Measure with a release build (`cargo build --release`).
 | Scroll a list of 100 000 entries | No dropped frames |
 | Disk IO on the main thread | Only for one-file operations (rename, new folder, trash) |
 
+**Open work:** The Finder-style UI raised the launch time to about 165 ms (measured). The target is 150 ms. The team must reduce it.
+
 ## Crates
 
 ```
@@ -38,6 +40,7 @@ This is the Ghostty model: a core library and a thin native shell. The shell con
 | `action` | The `Action` enum. Text form `name` or `name:param`. |
 | `keymap` | Trigger syntax, the binding trie, key sequences (`g>d`), the default bindings. |
 | `config` | The parser for the config file, the theme, the documented config template. |
+| `color` | `Rgba` colors and the parser for color values in themes. |
 | `fs` | `read_dir`, `Entry`, hidden and package rules, path helpers. |
 | `sort` | Natural sort, sort keys. |
 | `filter` | Live filter (substring or fuzzy, smart case). |
@@ -52,15 +55,23 @@ The public API of `bf-core` is the contract with `bf-app`. The doc comments in t
 | --- | --- |
 | `main` | CLI arguments. The `+` commands. Starts `NSApplication`. |
 | `app` | The app delegate, the main menu, the app state, the dispatch of actions. |
-| `window` | The `NSWindow`, the layout of the list, the status bar, and the prompt. |
+| `window` | The `NSWindow`, the split view (sidebar and content), the column header, the list, the prompt, the path and status bar, and the help overlay. |
 | `list_view` | A custom `NSView` in an `NSScrollView`. It draws only the visible rows. It handles keys and the mouse. It is the controller of the Quick Look panel. |
-| `status_bar` | One line at the bottom: counts, sort, hidden flag, filter, pending keys, messages. |
-| `prompt` | One `NSTextField` line for filter, go to folder, rename, and new folder. |
+| `columns` | The text of the list columns: size, Kind, and dates. It follows the locale, like Finder. |
+| `header` | The column header above the list. A click on a title sorts the list. |
+| `sidebar` | The sidebar (`NSOutlineView`, source list style) with Favorites and Locations. A background thread builds the model. |
+| `toolbar` | The unified toolbar: back, forward, and the Filter field. The window title shows the path. |
+| `status_bar` | One line at the bottom. It draws the path bar (crumbs), and the counts, free space, filter, pending keys, and messages. |
+| `prompt` | The text inputs: the bottom line for go to folder (and filter when the toolbar is off), the inline rename field, and the toolbar filter field. |
+| `goto_panel` | The Go to Folder panel with up to 8 matching folders. `Tab` completes the path. |
+| `help` | The key binding help overlay. `Escape` or `?` closes it. |
+| `file_ops` | File system helpers with data-safety rules, for example a rename that never replaces an item. |
 | `quicklook` | `QLPreviewPanel` data source and delegate. |
 | `icons` | File icons from `NSWorkspace`, with a cache. |
 | `theme` | `Rgba` to `NSColor`, fonts, row metrics. |
 | `loader` | Runs `bf_core::fs::read_dir` on a background thread. Sends the result to the main queue. |
 | `watcher` | Watches the current directory and the config files. Debounces the events. |
+| `debug` | Developer tools: timing traces, `--debug-keys`, and `--debug-screenshot`. |
 
 ## Main flows
 
