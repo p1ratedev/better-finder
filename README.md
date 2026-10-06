@@ -6,6 +6,7 @@ A fast, keyboard-first file explorer for macOS. It is written in Rust. You confi
 - **Keyboard first.** It has vim keys and Finder keys by default. You can bind any key or key sequence to any action. The page keys scroll smoothly, like nvim with smooth scroll: the view and the cursor move together.
 - **Configured with a dotfile.** One plain text file, `~/.config/better-finder/config`. The app reloads it without a restart.
 - **Native Quick Look.** Press `Space` to preview a file, like in Finder.
+- **Volumes.** Disks, disk images, and network volumes show in the sidebar when they mount. Press `cmd+e` or click the eject button of a volume to eject it, like in Finder.
 - **Finder-style UI.** It has a glass sidebar with Favorites and Locations, and a toolbar with a field that filters the list or goes to a path. It has a column header with sort, a Kind column, and a path bar. The system theme follows the macOS accent color. Rename happens inline in the list.
 
 See [docs/UI.md](docs/UI.md) for the UI design contract.
@@ -108,6 +109,7 @@ better-finder +validate-config         # check the config file for errors
 | `r` | Rename |
 | `cmd+shift+n` | New folder |
 | `cmd+Backspace` | Move to Trash |
+| `cmd+e` | Eject a volume: the selected sidebar row, the volume under the cursor, or the volume of the current folder. When the volume is in use, press `cmd+e` again within 5 s to force the eject |
 | `cc` `cn` | Copy the path or the name |
 | `T` | Open a terminal here |
 | `?` | Show all key bindings. `j` `k` and the page keys scroll the overlay. `q`, `Escape`, or `?` closes it |

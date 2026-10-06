@@ -10,6 +10,11 @@
 //!
 //! With `path-bar = false`: the status text only, like the first version
 //! (counts on the left; message and sort on the right).
+//!
+//! An error message can use more of the width than an info message: it
+//! tells what to do next (for example the busy message of `eject`). The
+//! crumbs get less space, and the free space hides when the message does
+//! not fit.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -158,6 +163,24 @@ fn counts_text(s: &AppState) -> Option<String> {
     Some(text)
 }
 
+/// The left limit of the message, as a part of the bar width. `normal` is
+/// the limit for an info message.
+fn message_limit(s: &AppState, normal: f64) -> f64 {
+    if s.message.as_ref().is_some_and(|m| m.error) {
+        0.05
+    } else {
+        normal
+    }
+}
+
+/// The width of `parts` with the gaps between them.
+fn parts_width(parts: &[Part]) -> f64 {
+    parts
+        .iter()
+        .map(|(text, attrs)| theme::text_width(text, attrs).ceil() + 1.0 + PART_GAP)
+        .sum()
+}
+
 /// Draws the parts from `right` to the left. The first part (the message)
 /// can shrink to `limit`. Returns the left end.
 fn draw_right(parts: &[Part], mut right: f64, limit: f64, y: f64, line: f64) -> f64 {
@@ -229,13 +252,15 @@ fn draw_path_bar(s: &AppState, bounds: NSRect, y: f64, line: f64) -> Vec<(f64, f
     if !status.is_empty() {
         right.push((status, st.bar.clone()));
     }
-    let left_end = draw_right(
-        &right,
-        bounds.size.width - END_PAD,
-        bounds.size.width * 0.45,
-        y,
-        line,
-    );
+    // An error message that does not fit hides the free space.
+    let limit = bounds.size.width * message_limit(s, 0.45);
+    let is_error = s.message.as_ref().is_some_and(|m| m.error);
+    if is_error && parts_width(&right) > bounds.size.width - END_PAD - limit {
+        if let (Some(counts), Some(last)) = (counts_text(s), right.last_mut()) {
+            last.0 = counts;
+        }
+    }
+    let left_end = draw_right(&right, bounds.size.width - END_PAD, limit, y, line);
 
     // The crumbs.
     let cwd = s.pane.cwd();
@@ -340,7 +365,7 @@ fn draw_status_only(s: &AppState, bounds: NSRect, y: f64, line: f64) {
     let left_end = draw_right(
         &right,
         bounds.size.width - END_PAD,
-        bounds.size.width * 0.35,
+        bounds.size.width * message_limit(s, 0.35),
         y,
         line,
     );

@@ -56,6 +56,7 @@ use crate::sidebar;
 use crate::smooth::{self, ListScroll, Target};
 use crate::status_bar::StatusBar;
 use crate::theme::{self, Style};
+use crate::volumes::{self, EjectOutcome, Volume};
 use crate::watcher;
 use crate::window::{self, Ui};
 
@@ -103,12 +104,15 @@ pub struct RunOptions {
 }
 
 /// A status bar message. Info messages fade after 3 s. Errors stay until
-/// the next action.
+/// the next action. A progress message (`Ejecting "X"…`) does not fade: the
+/// result of the task replaces it.
 pub struct Message {
     pub text: String,
     pub error: bool,
     born: Instant,
     id: u64,
+    /// A progress message: it does not fade.
+    sticky: bool,
 }
 
 const FADE_START: f64 = 3.0;
@@ -117,7 +121,7 @@ const FADE_TIME: f64 = 0.4;
 impl Message {
     /// 1.0 while the message is fresh, then down to 0.0 during the fade.
     pub fn alpha(&self) -> f64 {
-        if self.error {
+        if self.error || self.sticky {
             return 1.0;
         }
         let age = self.born.elapsed().as_secs_f64();
@@ -138,6 +142,23 @@ struct Rendered {
     sort: Option<bf_core::sort::SortOptions>,
     /// The match list of the location field: its place and the number of rows.
     location: Option<(PromptPlace, usize)>,
+}
+
+/// The time after a busy message in which one more `eject` forces the eject.
+const FORCE_WINDOW: Duration = Duration::from_secs(5);
+
+/// The state of the eject flow (docs/UI.md, "Volumes and eject").
+#[derive(Default)]
+struct EjectState {
+    /// The volume that ejects now: the mount point and the name.
+    running: Option<(PathBuf, String)>,
+    /// The volume that was busy, and the time of the busy message. One more
+    /// `eject` of it within `FORCE_WINDOW` forces the eject.
+    busy: Option<(PathBuf, Instant)>,
+    /// The most recent volume that this app ejected. Its unmount
+    /// notification shows no `was ejected` message. A volume list that has
+    /// this mount point again (a new mount) clears it.
+    ejected: Option<PathBuf>,
 }
 
 /// All state of the app. Main thread only.
@@ -193,6 +214,14 @@ pub struct AppState {
     window_shown: bool,
     /// The sidebar model that a thread builds at start.
     sidebar_start: Option<sidebar::PendingModel>,
+    /// The mounted volumes that are not hidden. A background thread reads
+    /// them at the start and after each mount, unmount, or rename.
+    volumes: Vec<Volume>,
+    eject: EjectState,
+    /// The mount points of unmounted volumes. After the next load, the
+    /// history forgets their folders (the load that leaves a volume adds
+    /// its folder to the history).
+    forget_after_load: Vec<PathBuf>,
     /// `NSApplication` keeps only a weak reference to its delegate.
     _delegate: Retained<AppDelegate>,
 }
@@ -598,6 +627,9 @@ pub fn run(options: RunOptions) -> ExitCode {
         rendered: Rendered::default(),
         window_shown: false,
         sidebar_start,
+        volumes: Vec::new(),
+        eject: EjectState::default(),
+        forget_after_load: Vec::new(),
         _delegate: delegate.clone(),
     };
     if let Some(text) = start_error.or_else(|| config_problem(&diagnostics, &warnings)) {
@@ -610,6 +642,8 @@ pub fn run(options: RunOptions) -> ExitCode {
     });
     watcher::start();
     watch_config_files();
+    volumes::observe(mtm);
+    volumes::refresh();
     // Show the window after the first load. When the load is slow, show
     // it after 150 ms with `Loading…`.
     after(Duration::from_millis(150), show_window);
@@ -909,6 +943,12 @@ enum Effect {
     ToggleSidebar,
     /// Move the focus to the sidebar, or back to the list.
     FocusSidebar,
+    /// Eject the volume at `mount` on a background thread.
+    Eject {
+        mount: PathBuf,
+        name: String,
+        force: bool,
+    },
     /// Clear the text of the toolbar filter field.
     ClearSearch,
     ReloadConfig,
@@ -986,6 +1026,7 @@ fn run_effects(mtm: MainThreadMarker, effects: Vec<Effect>) {
                 }
             }
             Effect::FocusSidebar => focus_sidebar(),
+            Effect::Eject { mount, name, force } => start_eject(mount, name, force),
             Effect::ClearSearch => {
                 let field = with_ref(|s| s.ui.toolbar.search_field()).flatten();
                 if let Some(field) = field {
@@ -1115,15 +1156,18 @@ fn focus_sidebar() {
 
 /// True when the sidebar has the keyboard focus.
 pub fn sidebar_focused() -> bool {
-    with_ref(|s| {
-        s.ui.window.firstResponder().is_some_and(|r| {
-            std::ptr::eq(
-                Retained::as_ptr(&r).cast::<u8>(),
-                Retained::as_ptr(&s.ui.sidebar.outline).cast::<u8>(),
-            )
-        })
+    with_ref(|s| sidebar_has_focus(&s.ui)).unwrap_or(false)
+}
+
+/// True when the sidebar is the first responder. It only reads AppKit
+/// state, so it is safe during a borrow of the app state.
+fn sidebar_has_focus(ui: &Ui) -> bool {
+    ui.window.firstResponder().is_some_and(|r| {
+        std::ptr::eq(
+            Retained::as_ptr(&r).cast::<u8>(),
+            Retained::as_ptr(&ui.sidebar.outline).cast::<u8>(),
+        )
     })
-    .unwrap_or(false)
 }
 
 /// Gives the keyboard focus back to the list.
@@ -1269,6 +1313,11 @@ fn stem_utf16_len(entry: &Entry) -> usize {
 
 impl AppState {
     fn set_message(&mut self, text: String, error: bool) {
+        self.push_message(text, error, false);
+    }
+
+    fn push_message(&mut self, text: String, error: bool, sticky: bool) {
+        trace!("message: {text}");
         self.message_id += 1;
         let id = self.message_id;
         self.message = Some(Message {
@@ -1276,8 +1325,9 @@ impl AppState {
             error,
             born: Instant::now(),
             id,
+            sticky,
         });
-        if !error {
+        if !error && !sticky {
             // Redraw a few times during the fade, then remove the message.
             for ms in [3000, 3100, 3200, 3300, 3400, 3500] {
                 after(Duration::from_millis(ms), move || message_tick(id));
@@ -1291,6 +1341,11 @@ impl AppState {
 
     fn set_error(&mut self, text: impl Into<String>) {
         self.set_message(text.into(), true);
+    }
+
+    /// A progress message: it stays until the next message.
+    fn set_progress(&mut self, text: impl Into<String>) {
+        self.push_message(text.into(), false, true);
     }
 
     /// A page action with the vim rules (`bf_core::viewport`). The pane
@@ -1628,12 +1683,155 @@ impl AppState {
                 }
             }
             Action::RevealInFinder => fx.push(Effect::Reveal(self.current_or_cwd())),
+            Action::Eject => self.eject(None, ql_visible, &mut fx),
             Action::OpenConfig => self.open_config(&mut fx),
             Action::ReloadConfig => fx.push(Effect::ReloadConfig),
             Action::Quit => fx.push(Effect::Quit),
             Action::Unbind => {}
         }
         fx
+    }
+
+    /// True when the current folder is on the volume at `mount`.
+    fn cwd_on(&self, mount: &Path) -> bool {
+        mount != Path::new("/")
+            && (self.pane.cwd().starts_with(mount)
+                || self.volume.as_ref().is_some_and(|v| v.mount == mount))
+    }
+
+    /// The volume with the mount point `path`, when it can eject.
+    fn ejectable_volume(&self, path: &Path) -> Option<Volume> {
+        self.volumes
+            .iter()
+            .find(|v| v.path == path && v.ejectable())
+            .cloned()
+    }
+
+    /// The volume for `eject`, in the order of docs/UI.md:
+    /// 1. With the focus in the sidebar (`sidebar` is `Some`): the selected row.
+    /// 2. The entry under the cursor, when it is the mount point of a volume.
+    /// 3. The volume of the current folder.
+    ///
+    /// The boot volume never ejects.
+    fn eject_target(&self, sidebar: Option<Option<PathBuf>>) -> Option<Volume> {
+        if let Some(row) = sidebar {
+            return row.and_then(|path| self.ejectable_volume(&path));
+        }
+        let under_cursor = self
+            .pane
+            .current()
+            .and_then(|e| self.ejectable_volume(&e.path));
+        if under_cursor.is_some() {
+            return under_cursor;
+        }
+        // The mount point from `statfs` (the loader thread), else the
+        // longest mount point that contains the current folder.
+        let cwd = self.pane.cwd();
+        let mount = self.volume.as_ref().map(|v| v.mount.clone()).or_else(|| {
+            self.volumes
+                .iter()
+                .filter(|v| cwd.starts_with(&v.path))
+                .max_by_key(|v| v.path.components().count())
+                .map(|v| v.path.clone())
+        })?;
+        self.ejectable_volume(&mount)
+    }
+
+    /// The `eject` action (`button` is `None`), or a click on the eject
+    /// button of the sidebar row `button`. See docs/UI.md, "The eject action".
+    fn eject(&mut self, button: Option<PathBuf>, ql_visible: bool, fx: &mut Vec<Effect>) {
+        if let Some((_, name)) = &self.eject.running {
+            let text = ejecting_text(name);
+            self.set_progress(text);
+            return;
+        }
+        let sidebar = match button {
+            Some(path) => Some(Some(path)),
+            None => sidebar_has_focus(&self.ui).then(sidebar::selected_path),
+        };
+        // The entry under the cursor can belong to the folder that goes away.
+        if sidebar.is_none() && self.refuse_while_navigating() {
+            return;
+        }
+        let target = self.eject_target(sidebar);
+        let busy = self
+            .eject
+            .busy
+            .take()
+            .filter(|(_, at)| at.elapsed() < FORCE_WINDOW)
+            .map(|(mount, _)| mount);
+        // In the busy time, `eject` forces the busy volume. A target that
+        // is another volume ejects normally.
+        let (volume, force) = match (target, busy) {
+            (Some(volume), Some(mount)) => {
+                let force = volume.path == mount;
+                (volume, force)
+            }
+            (None, Some(mount)) => match self.ejectable_volume(&mount) {
+                Some(volume) => (volume, true),
+                None => {
+                    self.set_info("Nothing to eject here");
+                    return;
+                }
+            },
+            (Some(volume), None) => (volume, false),
+            (None, None) => {
+                self.set_info("Nothing to eject here");
+                return;
+            }
+        };
+        trace!("eject: {} (force {force})", volume.path.display());
+        // Better Finder must not keep the volume busy.
+        self.leave_volume(&volume.path, ql_visible, fx);
+        self.set_progress(ejecting_text(&volume.name));
+        self.eject.running = Some((volume.path.clone(), volume.name.clone()));
+        fx.push(Effect::Eject {
+            mount: volume.path,
+            name: volume.name,
+            force,
+        });
+    }
+
+    /// Leaves the volume at `mount`, before an eject or after an unmount:
+    /// - Quick Look closes when it shows a file on the volume.
+    /// - A rename or new-folder prompt on the volume cancels.
+    /// - When the current folder is on the volume, the pane goes to the
+    ///   home folder. The watcher then watches the home folder.
+    ///
+    /// Returns true when the pane goes to the home folder.
+    fn leave_volume(&mut self, mount: &Path, ql_visible: bool, fx: &mut Vec<Effect>) -> bool {
+        let on_volume = self.cwd_on(mount);
+        let shows_volume = on_volume
+            || self
+                .pane
+                .current()
+                .is_some_and(|e| e.path.starts_with(mount));
+        if ql_visible && shows_volume {
+            fx.push(Effect::QuickLookClose);
+        }
+        if matches!(&self.prompt, Some(PromptMode::Rename { source }) if source.starts_with(mount))
+        {
+            self.close_prompt(fx);
+        }
+        if self
+            .pending_rename
+            .as_ref()
+            .is_some_and(|p| p.starts_with(mount))
+        {
+            self.pending_rename = None;
+        }
+        if self
+            .pending_select
+            .as_ref()
+            .is_some_and(|(dir, _)| dir.starts_with(mount))
+        {
+            self.pending_select = None;
+        }
+        if on_volume {
+            let request = self.pane.navigate_to(home_dir());
+            self.start_load(request);
+        }
+        on_volume
     }
 
     fn trash(&mut self) {
@@ -1982,6 +2180,12 @@ pub fn finish_load(delivery: Delivery) {
                 s.pending_rename = Some(path);
             }
         }
+        if failed.is_none() {
+            // The load left an unmounted volume: forget its folders now.
+            for mount in std::mem::take(&mut s.forget_after_load) {
+                s.pane.forget_history_under(&mount);
+            }
+        }
         if s.refresh_queued && !s.pane.is_loading() {
             s.refresh_queued = false;
             let auto = std::mem::take(&mut s.refresh_queued_auto);
@@ -2031,6 +2235,169 @@ pub fn auto_refresh() {
         s.start_load(request);
         s.load_auto = true;
     });
+}
+
+// ---- Volumes and eject ----
+
+fn ejecting_text(name: &str) -> String {
+    format!("Ejecting \"{name}\"\u{2026}")
+}
+
+/// The key text of `eject` in the keymap, for the busy message: the
+/// shortest trigger, for example `cmd+e`.
+fn eject_key(keymap: &Keymap) -> Option<String> {
+    keymap
+        .bindings()
+        .into_iter()
+        .filter(|(_, action)| *action == Action::Eject)
+        .min_by_key(|(trigger, _)| trigger.0.len())
+        .map(|(trigger, _)| trigger.to_string())
+}
+
+/// A click on the eject button of a sidebar row: eject the volume `path`.
+pub fn eject_volume(path: PathBuf) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let ql_visible = quicklook::is_visible(mtm);
+    trace!("action: eject (button) {}", path.display());
+    let effects = with(|s| {
+        if s.message.as_ref().is_some_and(|m| m.error) {
+            s.message = None;
+        }
+        let mut fx = Vec::new();
+        s.eject(Some(path), ql_visible, &mut fx);
+        fx
+    })
+    .unwrap_or_default();
+    run_effects(mtm, effects);
+    sync_ui();
+}
+
+/// Starts the eject on a background thread. The watcher first stops its
+/// stream when the stream is on the volume. The result goes to
+/// `eject_finished` on the main queue.
+fn start_eject(mount: PathBuf, name: String, force: bool) {
+    let thread_mount = mount.clone();
+    watcher::release_volume(mount.clone(), move || {
+        volumes::spawn_eject(thread_mount, force, move |outcome| {
+            after_now(move || eject_finished(mount, name, outcome));
+        });
+    });
+}
+
+/// The result of an eject: `Ejected "X"`, the busy message, or the reason
+/// of the failure.
+fn eject_finished(mount: PathBuf, name: String, outcome: EjectOutcome) {
+    let ejected = outcome == EjectOutcome::Ejected;
+    let busy_message = with(|s| {
+        if s.eject.running.as_ref().is_some_and(|(m, _)| *m == mount) {
+            s.eject.running = None;
+        }
+        match outcome {
+            EjectOutcome::Ejected => {
+                s.eject.ejected = Some(mount.clone());
+                s.set_info(format!("Ejected \"{name}\""));
+                None
+            }
+            EjectOutcome::Busy(apps) => {
+                let key = eject_key(&s.config.keymap);
+                s.set_error(volumes::busy_text(&name, &apps, key.as_deref()));
+                s.eject.busy = Some((mount.clone(), Instant::now()));
+                Some(s.message_id)
+            }
+            EjectOutcome::Failed(reason) => {
+                s.set_error(format!("Cannot eject \"{name}\": {reason}"));
+                None
+            }
+        }
+    })
+    .flatten();
+    if let Some(id) = busy_message {
+        // The force time ends: remove its message.
+        after(FORCE_WINDOW, move || remove_message(id));
+    }
+    redraw_status();
+    if ejected {
+        volumes_changed();
+    }
+}
+
+/// Removes the message `id` when it still shows.
+fn remove_message(id: u64) {
+    let removed = with(|s| {
+        let shows = s.message.as_ref().is_some_and(|m| m.id == id);
+        if shows {
+            s.message = None;
+        }
+        shows
+    });
+    if removed == Some(true) {
+        redraw_status();
+    }
+}
+
+/// A new volume list from the background thread.
+pub fn set_volumes(volumes: Vec<Volume>) {
+    trace!(
+        "volumes: {:?} after {} ms",
+        volumes.iter().map(|v| v.name.as_str()).collect::<Vec<_>>(),
+        debug::since_start().as_millis()
+    );
+    with(|s| {
+        let mounted_again = s
+            .eject
+            .ejected
+            .as_ref()
+            .is_some_and(|m| volumes.iter().any(|v| v.path == *m));
+        if mounted_again {
+            s.eject.ejected = None;
+        }
+        s.volumes = volumes;
+    });
+}
+
+/// A volume mounted, unmounted, or changed its name: read the volume list
+/// and build the sidebar again.
+pub fn volumes_changed() {
+    rebuild_sidebar();
+    volumes::refresh();
+}
+
+/// A volume unmounted, for any reason: this app ejected it, another app
+/// ejected it, or the cable came out. When the current folder is on it,
+/// the pane goes to the home folder and shows `"X" was ejected`. Quick
+/// Look and the prompts on the volume close. The history forgets the
+/// folders on the volume.
+pub fn volume_unmounted(mount: PathBuf, name: Option<String>) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let ql_visible = quicklook::is_visible(mtm);
+    let effects = with(|s| {
+        let mut fx = Vec::new();
+        if mount == Path::new("/") {
+            return fx;
+        }
+        let ours = s.eject.running.as_ref().is_some_and(|(m, _)| *m == mount)
+            || s.eject.ejected.as_ref() == Some(&mount);
+        if s.eject.busy.as_ref().is_some_and(|(m, _)| *m == mount) {
+            s.eject.busy = None;
+        }
+        if s.leave_volume(&mount, ql_visible, &mut fx) {
+            if !ours {
+                let name = name.unwrap_or_else(|| file_name(&mount));
+                s.set_info(format!("\"{name}\" was ejected"));
+            }
+            s.forget_after_load.push(mount.clone());
+        }
+        s.pane.forget_history_under(&mount);
+        fx
+    })
+    .unwrap_or_default();
+    run_effects(mtm, effects);
+    sync_ui();
+    volumes_changed();
 }
 
 /// Redraws the whole list (for example when new icons are available).

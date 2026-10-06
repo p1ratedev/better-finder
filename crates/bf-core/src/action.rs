@@ -62,6 +62,9 @@ pub enum Action {
     /// Open the configured terminal app in the current directory.
     OpenTerminal,
     RevealInFinder,
+    /// Eject a volume: the selected sidebar row, the volume under the
+    /// cursor, or the volume of the current folder.
+    Eject,
 
     // App.
     /// Open the config file. Create it from the template when it does not exist.
@@ -158,6 +161,7 @@ impl FromStr for Action {
             "copy_name" => Self::CopyName,
             "open_terminal" => Self::OpenTerminal,
             "reveal_in_finder" => Self::RevealInFinder,
+            "eject" => Self::Eject,
             "open_config" => Self::OpenConfig,
             "reload_config" => Self::ReloadConfig,
             "quit" => Self::Quit,
@@ -205,6 +209,7 @@ impl fmt::Display for Action {
             Self::CopyName => "copy_name",
             Self::OpenTerminal => "open_terminal",
             Self::RevealInFinder => "reveal_in_finder",
+            Self::Eject => "eject",
             Self::OpenConfig => "open_config",
             Self::ReloadConfig => "reload_config",
             Self::Quit => "quit",
@@ -264,6 +269,10 @@ static CATALOG: &[(&str, &str)] = &[
         "Open the terminal app in the current directory.",
     ),
     ("reveal_in_finder", "Show the entry in Finder."),
+    (
+        "eject",
+        "Eject the volume of the sidebar row, the cursor, or the current folder.",
+    ),
     ("open_config", "Open the config file."),
     ("reload_config", "Read the config file again."),
     ("quit", "Quit the app."),
@@ -294,7 +303,7 @@ mod tests {
             assert_eq!(a.to_string().parse::<Action>().unwrap(), a);
             assert!(!a.description().is_empty(), "{a}");
         }
-        assert_eq!(all_actions().len(), 35);
+        assert_eq!(all_actions().len(), 36);
     }
 
     #[test]

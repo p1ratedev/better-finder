@@ -419,6 +419,22 @@ pub fn watch_directory(path: &Path) {
     });
 }
 
+/// Stops the directory stream when it watches a folder on the volume at
+/// `mount`. Then it runs `then` on the watcher queue, so `then` runs after
+/// the stop. Keep `then` short: for example, let it start a thread.
+pub fn release_volume(mount: PathBuf, then: impl FnOnce() + Send + 'static) {
+    on_queue(move |_, streams| {
+        if streams
+            .directory
+            .as_ref()
+            .is_some_and(|(path, _)| path.starts_with(&mount))
+        {
+            streams.directory = None;
+        }
+        then();
+    });
+}
+
 /// Watches the config files `files`. A missing file is fine: the watch is
 /// on its directory. For a symlink, the directory of the real file is
 /// watched too.

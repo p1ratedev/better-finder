@@ -2,6 +2,7 @@
 //!
 //! - `rename_no_replace` never replaces an existing item.
 //! - `is_local_volume` tells a local disk from a network volume.
+//! - `volume_info` and `mounted_from` read the volume of a path (`statfs`).
 
 use std::ffi::CString;
 use std::io::{self, Write};
@@ -123,6 +124,22 @@ pub fn volume_info(path: &Path) -> Option<VolumeInfo> {
     Some(VolumeInfo { mount, name, free })
 }
 
+/// The source of the volume of `path` (`f_mntfromname`), for example
+/// `/dev/disk5s1`, or `//user@server/share` for a network volume. It
+/// accesses the disk: call it on a background thread.
+pub fn mounted_from(path: &Path) -> Option<String> {
+    let c = c_path(path).ok()?;
+    // SAFETY: `statfs` is plain data; zero is a valid bit pattern for it.
+    let mut info: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is a valid C string and `info` is a valid out pointer.
+    if unsafe { libc::statfs(c.as_ptr(), &mut info) } != 0 {
+        return None;
+    }
+    // SAFETY: `f_mntfromname` is a NUL-terminated C string inside `info`.
+    let from = unsafe { std::ffi::CStr::from_ptr(info.f_mntfromname.as_ptr()) };
+    Some(from.to_string_lossy().into_owned())
+}
+
 fn volume_name(mount: &Path) -> Option<String> {
     use objc2_foundation::{NSArray, NSString, NSURL, NSURLVolumeLocalizedNameKey};
     let url = NSURL::from_directory_path(mount)?;
@@ -192,6 +209,13 @@ mod tests {
         assert_eq!(info.mount, PathBuf::from("/"));
         assert!(!info.name.is_empty());
         assert!(info.free > 0);
+    }
+
+    #[test]
+    fn the_boot_volume_comes_from_a_disk() {
+        let from = mounted_from(&std::env::temp_dir()).expect("statfs");
+        assert!(from.starts_with("/dev/disk"), "{from}");
+        assert!(mounted_from(Path::new("/no/such/path/for/bf")).is_none());
     }
 
     #[test]

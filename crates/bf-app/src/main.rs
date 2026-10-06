@@ -22,6 +22,7 @@ mod smooth;
 mod status_bar;
 mod theme;
 mod toolbar;
+mod volumes;
 mod watcher;
 mod window;
 
@@ -49,13 +50,17 @@ Usage:
 Developer options:
   --debug-screenshot <png>           Save the window as a PNG after the first load, then quit
   --debug-keys \"<t1> <t2> ...\"       Feed key triggers (keymap syntax) before the screenshot.
-                                     @<ms> waits, @load waits for a load. Prefixes:
+                                     @<ms> waits, @load waits for a load,
+                                     @w<w>x<h> sets the window size, @eject:<name>
+                                     clicks the eject button of a sidebar row. Prefixes:
                                      ~ key repeat, ! keymap also with the prompt open,
                                      ^ same turn as the previous key (no wait for a load)
   --debug-appearance light|dark      Force the appearance (for the system and auto themes)
 
 Environment:
   BETTER_FINDER_TRACE=1              Print timings to stderr
+  BETTER_FINDER_SCREENCAPTURE=own    The screenshot shows the real window (glass too).
+                                     The value 1 uses screencapture (needs the permission)
   XDG_CONFIG_HOME                    The config is $XDG_CONFIG_HOME/better-finder/config
 ";
 

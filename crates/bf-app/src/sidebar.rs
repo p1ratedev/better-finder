@@ -5,6 +5,9 @@
 //! - A background thread builds the model: existence checks, display names,
 //!   and the volume list access the disk. The main thread only shows it.
 //! - The row of the current folder is selected. A click opens the row.
+//! - A volume row, except the boot volume, has an eject button at its
+//!   trailing edge, like Finder. The `volumes` module observes the mounts
+//!   and asks for a new model.
 //! - With the keyboard focus in the sidebar, `j`, `k`, and the arrows move
 //!   the selection; `enter`, `l`, and `right` open the folder; `escape`,
 //!   `tab`, and `h` give the focus back to the list. Other keys go to the
@@ -18,18 +21,16 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSAutoresizingMaskOptions, NSBackgroundStyle, NSColor, NSControl, NSControlTextEditingDelegate,
-    NSEvent, NSEventModifierFlags, NSFont, NSFontWeightSemibold, NSImageScaling, NSImageView,
-    NSLineBreakMode, NSOutlineView, NSOutlineViewDataSource, NSOutlineViewDelegate, NSResponder,
-    NSScrollView, NSTableCellView, NSTableColumn, NSTableRowView, NSTableView,
+    NSAutoresizingMaskOptions, NSBackgroundStyle, NSButton, NSCellImagePosition, NSColor,
+    NSControl, NSControlTextEditingDelegate, NSEvent, NSEventModifierFlags, NSFont,
+    NSFontWeightRegular, NSFontWeightSemibold, NSImage, NSImageScaling, NSImageSymbolConfiguration,
+    NSImageView, NSLineBreakMode, NSOutlineView, NSOutlineViewDataSource, NSOutlineViewDelegate,
+    NSResponder, NSScrollView, NSTableCellView, NSTableColumn, NSTableRowView, NSTableView,
     NSTableViewDataSource, NSTableViewRowSizeStyle, NSTableViewStyle, NSTextField, NSView,
-    NSWorkspace, NSWorkspaceDidMountNotification, NSWorkspaceDidRenameVolumeNotification,
-    NSWorkspaceDidUnmountNotification,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSArray, NSFileManager, NSIndexSet, NSInteger, NSNotification, NSNumber,
-    NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSURLVolumeIsInternalKey,
-    NSURLVolumeIsLocalKey, NSURLVolumeLocalizedNameKey, NSVolumeEnumerationOptions,
+    MainThreadMarker, NSFileManager, NSIndexSet, NSInteger, NSObject, NSObjectProtocol, NSPoint,
+    NSRect, NSSize, NSString,
 };
 
 use bf_core::KeyEvent;
@@ -46,6 +47,8 @@ pub struct Row {
     pub name: String,
     /// The SF Symbol name.
     pub symbol: &'static str,
+    /// The row is a volume that can eject: it has an eject button.
+    pub eject: bool,
 }
 
 /// The rows of the two groups.
@@ -90,6 +93,7 @@ pub fn build_model(items: &[PathBuf], locations: bool) -> Model {
                 .displayNameAtPath(&NSString::from_str(&path.to_string_lossy()))
                 .to_string(),
             symbol: symbol_for(path, &home),
+            eject: false,
         })
         .collect();
     let mut model = Model {
@@ -105,70 +109,27 @@ pub fn build_model(items: &[PathBuf], locations: bool) -> Model {
             path: icloud,
             name: "iCloud Drive".to_string(),
             symbol: "icloud",
+            eject: false,
         });
     }
-    model.locations.extend(volumes());
+    model
+        .locations
+        .extend(crate::volumes::list().into_iter().map(|v| Row {
+            eject: v.ejectable(),
+            path: v.path,
+            name: v.name,
+            symbol: v.symbol,
+        }));
     let trash = home.join(".Trash");
     if trash.is_dir() {
         model.locations.push(Row {
             path: trash,
             name: "Trash".to_string(),
             symbol: "trash",
+            eject: false,
         });
     }
     model
-}
-
-/// The mounted volumes that are not hidden, the boot volume first.
-fn volumes() -> Vec<Row> {
-    let manager = NSFileManager::defaultManager();
-    // SAFETY: The resource keys are immutable statics from Foundation.
-    let (name_key, internal_key, local_key) = unsafe {
-        (
-            NSURLVolumeLocalizedNameKey,
-            NSURLVolumeIsInternalKey,
-            NSURLVolumeIsLocalKey,
-        )
-    };
-    let keys = NSArray::from_slice(&[name_key, internal_key, local_key]);
-    let Some(urls) = manager.mountedVolumeURLsIncludingResourceValuesForKeys_options(
-        Some(&keys),
-        NSVolumeEnumerationOptions::SkipHiddenVolumes,
-    ) else {
-        return Vec::new();
-    };
-    let mut rows: Vec<Row> = Vec::new();
-    for url in urls.iter() {
-        let Some(path) = url.to_file_path() else {
-            continue;
-        };
-        let Ok(values) = url.resourceValuesForKeys_error(&keys) else {
-            continue;
-        };
-        let flag = |key: &objc2_foundation::NSURLResourceKey| {
-            values
-                .objectForKey(key)
-                .and_then(|v| v.downcast::<NSNumber>().ok())
-                .map(|n| n.boolValue())
-        };
-        let name = values
-            .objectForKey(name_key)
-            .and_then(|v| v.downcast::<NSString>().ok())
-            .map(|s| s.to_string())
-            .or_else(|| path.file_name().map(|n| n.to_string_lossy().into_owned()))
-            .unwrap_or_else(|| path.to_string_lossy().into_owned());
-        let symbol = if flag(local_key) == Some(false) {
-            "network"
-        } else if flag(internal_key) == Some(true) {
-            "internaldrive"
-        } else {
-            "externaldrive"
-        };
-        rows.push(Row { path, name, symbol });
-    }
-    // The boot volume first.
-    rows.sort_by_key(|r| r.path != Path::new("/"));
-    rows
 }
 
 /// What an outline item is.
@@ -182,6 +143,7 @@ enum Item {
 pub struct CellIvars {
     image: OnceCell<Retained<NSImageView>>,
     text: OnceCell<Retained<NSTextField>>,
+    eject: OnceCell<Retained<NSButton>>,
 }
 
 define_class!(
@@ -205,10 +167,16 @@ define_class!(
 );
 
 impl SidebarCell {
-    fn new(mtm: MainThreadMarker, row: &Row) -> Retained<Self> {
+    /// The width of the eject button and its gap to the trailing edge.
+    const EJECT_WIDTH: f64 = 18.0;
+    const EJECT_GAP: f64 = 4.0;
+
+    /// A cell for `row`. The eject button sends `ejectClicked:` to `target`.
+    fn new(mtm: MainThreadMarker, row: &Row, target: &SidebarController) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(CellIvars {
             image: OnceCell::new(),
             text: OnceCell::new(),
+            eject: OnceCell::new(),
         });
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(160.0, 24.0));
         // SAFETY: `initWithFrame:` is the designated initializer of NSView.
@@ -231,9 +199,15 @@ impl SidebarCell {
         let text = NSTextField::labelWithString(&NSString::from_str(&row.name), mtm);
         text.setFont(Some(&NSFont::systemFontOfSize(13.0)));
         text.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+        let width = frame.size.width;
+        let text_end = if row.eject {
+            width - Self::EJECT_WIDTH - Self::EJECT_GAP - 2.0
+        } else {
+            width - 4.0
+        };
         text.setFrame(NSRect::new(
             NSPoint::new(26.0, 4.0),
-            NSSize::new(130.0, 16.0),
+            NSSize::new(text_end - 26.0, 16.0),
         ));
         text.setAutoresizingMask(
             NSAutoresizingMaskOptions::ViewWidthSizable
@@ -246,6 +220,15 @@ impl SidebarCell {
         unsafe {
             cell.setImageView(Some(&image_view));
             cell.setTextField(Some(&text));
+        }
+        if row.eject {
+            let button = eject_button(mtm, target);
+            button.setFrame(NSRect::new(
+                NSPoint::new(width - Self::EJECT_WIDTH - Self::EJECT_GAP, 3.0),
+                NSSize::new(Self::EJECT_WIDTH, 18.0),
+            ));
+            cell.addSubview(&button);
+            let _ = cell.ivars().eject.set(button);
         }
         let _ = cell.ivars().image.set(image_view);
         let _ = cell.ivars().text.set(text);
@@ -274,7 +257,50 @@ impl SidebarCell {
         if let Some(i) = self.ivars().image.get() {
             i.setContentTintColor(Some(&icon));
         }
+        if let Some(button) = self.ivars().eject.get() {
+            let tint = if style == NSBackgroundStyle::Emphasized {
+                NSColor::alternateSelectedControlTextColor()
+            } else {
+                NSColor::secondaryLabelColor()
+            };
+            button.setContentTintColor(Some(&tint));
+        }
     }
+}
+
+/// The eject button of a volume row: the SF Symbol `eject` in the secondary
+/// color, without a border, like Finder. It never takes the keyboard focus.
+fn eject_button(mtm: MainThreadMarker, target: &SidebarController) -> Retained<NSButton> {
+    let label = NSString::from_str("Eject");
+    let image = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+        &NSString::from_str("eject"),
+        Some(&label),
+    );
+    // SAFETY: The weight is an immutable static from AppKit.
+    let weight = unsafe { NSFontWeightRegular };
+    let config = NSImageSymbolConfiguration::configurationWithPointSize_weight(11.0, weight);
+    let image = image.and_then(|i| i.imageWithSymbolConfiguration(&config));
+    let button = NSButton::new(mtm);
+    if let Some(image) = image {
+        image.setTemplate(true);
+        button.setImage(Some(&image));
+    }
+    button.setImagePosition(NSCellImagePosition::ImageOnly);
+    button.setBordered(false);
+    button.setRefusesFirstResponder(true);
+    button.setToolTip(Some(&label));
+    button.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewMinXMargin
+            | NSAutoresizingMaskOptions::ViewMinYMargin
+            | NSAutoresizingMaskOptions::ViewMaxYMargin,
+    );
+    // SAFETY: The controller lives in a thread-local for the whole life of
+    // the app, and it implements `ejectClicked:`.
+    unsafe {
+        button.setTarget(Some(target));
+        button.setAction(Some(sel!(ejectClicked:)));
+    }
+    button
 }
 
 define_class!(
@@ -487,9 +513,9 @@ define_class!(
             }
         }
 
-        #[unsafe(method(volumesChanged:))]
-        fn volumes_changed(&self, _notification: &NSNotification) {
-            app::rebuild_sidebar();
+        #[unsafe(method(ejectClicked:))]
+        fn eject_clicked(&self, sender: Option<&AnyObject>) {
+            self.eject_clicked_row(sender);
         }
     }
 );
@@ -552,7 +578,7 @@ impl SidebarController {
                 let model = self.ivars().model.borrow();
                 let row = group_rows(&model, g).get(i)?.clone();
                 drop(model);
-                let cell = SidebarCell::new(mtm, &row);
+                let cell = SidebarCell::new(mtm, &row, self);
                 Some(Retained::into_super(Retained::into_super(cell)))
             }
         }
@@ -589,6 +615,20 @@ impl SidebarController {
         let object = NSString::from_str(&format!("{item:?}"));
         items.push((object.clone(), item));
         Retained::into_super(Retained::into_super(object))
+    }
+
+    /// A click on the eject button of a row: eject the volume of the row.
+    fn eject_clicked_row(&self, sender: Option<&AnyObject>) {
+        let Some(outline) = self.ivars().outline.get() else {
+            return;
+        };
+        let Some(view) = sender.and_then(|s| s.downcast_ref::<NSView>()) else {
+            return;
+        };
+        let row = outline.rowForView(view);
+        if let Some(path) = self.path_at_row(outline, row) {
+            app::eject_volume(path);
+        }
     }
 
     fn path_at_row(&self, outline: &NSOutlineView, row: NSInteger) -> Option<PathBuf> {
@@ -698,25 +738,6 @@ pub fn create(mtm: MainThreadMarker) -> SidebarUi {
     scroll.setHasVerticalScroller(true);
     scroll.setAutohidesScrollers(true);
     let _ = controller.ivars().outline.set(outline.clone());
-
-    // Volume changes rebuild the Locations group.
-    let center = NSWorkspace::sharedWorkspace().notificationCenter();
-    // SAFETY: The notification names are immutable statics. The observer
-    // lives for the whole life of the app.
-    unsafe {
-        for name in [
-            NSWorkspaceDidMountNotification,
-            NSWorkspaceDidUnmountNotification,
-            NSWorkspaceDidRenameVolumeNotification,
-        ] {
-            center.addObserver_selector_name_object(
-                &controller,
-                sel!(volumesChanged:),
-                Some(name),
-                None,
-            );
-        }
-    }
     CONTROLLER.with(|c| {
         let _ = c.set(controller);
     });
@@ -769,6 +790,41 @@ impl PendingModel {
 pub fn apply_model(model: Model) {
     with_controller(|c| c.set_model(model));
     app::sync_sidebar_selection();
+}
+
+/// The path of the selected row, or `None` when no row is selected.
+pub fn selected_path() -> Option<PathBuf> {
+    with_controller(|c| {
+        let outline = c.ivars().outline.get()?;
+        c.path_at_row(outline, outline.selectedRow())
+    })
+    .flatten()
+}
+
+/// Clicks the eject button of the row with the name `name`, for
+/// `--debug-keys`. False when no row with an eject button has the name.
+pub fn click_eject_button(name: &str) -> bool {
+    let button = with_controller(|c| {
+        let outline = c.ivars().outline.get()?;
+        let item = {
+            let model = c.ivars().model.borrow();
+            let index = model.locations.iter().position(|r| r.name == name)?;
+            Item::Row(1, index)
+        };
+        let object = c.object_for(item);
+        // SAFETY: `object` is an item of this outline view.
+        let row = unsafe { outline.rowForItem(Some(&object)) };
+        let view = outline.viewAtColumn_row_makeIfNecessary(0, row, false)?;
+        let cell = view.downcast::<SidebarCell>().ok()?;
+        cell.ivars().eject.get().cloned()
+    })
+    .flatten();
+    let Some(button) = button else {
+        return false;
+    };
+    // SAFETY: `None` is a valid sender.
+    unsafe { button.performClick(None) };
+    true
 }
 
 /// Selects the row of `path`. Call it without a borrow of the app state.

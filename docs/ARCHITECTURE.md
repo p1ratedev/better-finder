@@ -61,7 +61,8 @@ The public API of `bf-core` is the contract with `bf-app`. The doc comments in t
 | `list_view` | A custom `NSView` in an `NSScrollView`. It draws only the dirty rows. It handles keys and the mouse. It is the controller of the Quick Look panel. During a smooth scroll, a small subview shows the moving cursor highlight. |
 | `columns` | The text of the list columns: size, Kind, and dates. It follows the locale, like Finder. |
 | `header` | The column header above the list. A click on a title sorts the list. |
-| `sidebar` | The sidebar (`NSOutlineView`, source list style) with Favorites and Locations. A background thread builds the model. |
+| `sidebar` | The sidebar (`NSOutlineView`, source list style) with Favorites and Locations. A background thread builds the model. A volume row has an eject button. |
+| `volumes` | The mounted volumes (read on a background thread) and the mount, unmount, and rename notifications. The eject runs on a background thread: `NSWorkspace` ejects the volume, `lsof` finds the apps that keep it busy, and `diskutil` forces the eject. |
 | `toolbar` | The unified toolbar: back, forward, and the location and filter field. The window title shows the path. |
 | `status_bar` | One line at the bottom. It draws the path bar (crumbs), and the counts, free space, filter, pending keys, and messages. |
 | `prompt` | The text inputs: the bottom line (the location and filter field when the toolbar is off), the inline rename field, and the toolbar field. One delegate serves all of them. |

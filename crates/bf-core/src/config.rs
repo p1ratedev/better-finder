@@ -1118,7 +1118,10 @@ const TEMPLATE_SECTIONS: &[(&str, &[TemplateKey])] = &[
             tk(
                 "sidebar-locations",
                 "true",
-                &["Show iCloud Drive, the volumes, and the Trash: true or false."],
+                &[
+                    "Show iCloud Drive, the volumes, and the Trash: true or false.",
+                    "A volume row has an eject button. The eject action ejects a volume.",
+                ],
             ),
             tk(
                 "toolbar",

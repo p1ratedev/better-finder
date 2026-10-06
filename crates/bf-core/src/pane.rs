@@ -248,6 +248,21 @@ impl Pane {
         !self.forward.is_empty()
     }
 
+    /// Removes the back and forward entries in `prefix` (the folder itself
+    /// and all folders in it), for example the folders of an ejected volume.
+    /// Then it removes the entries that are the same as the next entry or
+    /// as the current directory. So back and forward always change the
+    /// directory.
+    pub fn forget_history_under(&mut self, prefix: &Path) {
+        for stack in [&mut self.back, &mut self.forward] {
+            stack.retain(|path| !path.starts_with(prefix));
+            stack.dedup();
+            while stack.last() == Some(&self.cwd) {
+                stack.pop();
+            }
+        }
+    }
+
     /// `None` when the back stack is empty.
     pub fn back(&mut self) -> Option<LoadRequest> {
         let path = self.back.last()?.clone();
@@ -558,6 +573,52 @@ mod tests {
         assert_eq!(pane.cwd(), Path::new("/a/x"));
         assert!(pane.forward().is_none());
         assert!(pane.back().is_some());
+    }
+
+    /// Goes to `path` and completes the load.
+    fn visit(pane: &mut Pane, path: &str) {
+        let req = pane.navigate_to(path.into());
+        load(pane, &req, &["x"]);
+    }
+
+    /// Back (or forward) with a completed load. The new directory, or
+    /// `None` when that history is empty.
+    fn step(pane: &mut Pane, forward: bool) -> Option<PathBuf> {
+        let req = if forward { pane.forward() } else { pane.back() }?;
+        load(pane, &req, &["x"]);
+        Some(pane.cwd().to_path_buf())
+    }
+
+    #[test]
+    fn forget_history_under_a_volume() {
+        let mut pane = pane_at("/a", &["x"]);
+        for path in ["/Volumes/X", "/Volumes/X2", "/Volumes/X/sub", "/b"] {
+            visit(&mut pane, path);
+        }
+        // Back to `/a`: all the other folders are in the forward history.
+        while step(&mut pane, false).is_some() {}
+        assert_eq!(pane.cwd(), Path::new("/a"));
+        pane.forget_history_under(Path::new("/Volumes/X"));
+        // `/Volumes/X2` is another volume: it stays.
+        assert_eq!(step(&mut pane, true), Some(PathBuf::from("/Volumes/X2")));
+        assert_eq!(step(&mut pane, true), Some(PathBuf::from("/b")));
+        assert_eq!(step(&mut pane, true), None);
+        assert_eq!(step(&mut pane, false), Some(PathBuf::from("/Volumes/X2")));
+        assert_eq!(step(&mut pane, false), Some(PathBuf::from("/a")));
+    }
+
+    #[test]
+    fn forget_history_removes_repeats_and_the_current_directory() {
+        let mut pane = pane_at("/a", &["x"]);
+        for path in ["/Volumes/X", "/a", "/home", "/Volumes/X/sub", "/home"] {
+            visit(&mut pane, path);
+        }
+        pane.forget_history_under(Path::new("/Volumes/X"));
+        // Without the volume, the back history is `/a`, `/a`, `/home`, and
+        // `/home` is the current directory. Each back step must change the
+        // directory, so only `/a` stays.
+        assert_eq!(step(&mut pane, false), Some(PathBuf::from("/a")));
+        assert!(!pane.can_go_back());
     }
 
     #[test]

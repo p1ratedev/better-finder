@@ -409,6 +409,7 @@ pub const DEFAULT_BINDINGS: &[&str] = &[
     "c>n=copy_name",
     "cmd+alt+c=copy_path",
     "T=open_terminal",
+    "cmd+e=eject",
     // App
     "cmd+comma=open_config",
     "cmd+shift+comma=reload_config",
@@ -814,6 +815,24 @@ mod tests {
         assert_eq!(
             feed(&mut st, &map, cmd_f),
             KeyOutcome::Action(Action::Filter)
+        );
+    }
+
+    #[test]
+    fn eject_default_key() {
+        let map = Keymap::default();
+        let mut st = KeymapState::default();
+        let cmd_e = KeyEvent {
+            base: Key::Char('e'),
+            shifted: None,
+            mods: Mods {
+                cmd: true,
+                ..Mods::default()
+            },
+        };
+        assert_eq!(
+            feed(&mut st, &map, cmd_e),
+            KeyOutcome::Action(Action::Eject)
         );
     }
 
