@@ -125,6 +125,50 @@ Column text:
 
 The `goto_prompt` action shows a floating panel at the top center of the content, like the Finder Go to Folder panel: a rounded material background, a 13 pt field, and up to 8 matching folders below the field. `Tab` completes, `up` and `down` select a match, and `Enter` goes. The bottom prompt is the fallback.
 
+## Location and filter field
+
+The `filter` action (`/`, `cmd+f`) focuses one field: the toolbar search field, or the bottom prompt when `toolbar = false`. The placeholder is `Filter or go to a path`. The text selects the mode:
+
+- **Path mode:** the text starts with `~`, contains `/`, or is `.` or `..`.
+  - Up to 8 matching folders show below the field, like the Go to Folder panel.
+  - `Tab` completes the longest common prefix. `up` and `down` select a match.
+  - `Enter` on a folder goes to it. `Enter` on a file goes to its parent folder and selects the file. A missing path shows `No such folder`, and the field stays open.
+  - After a navigation, the field clears and the list gets the focus.
+  - The path check runs on a background thread, as in the Go to Folder panel.
+- **Filter mode:** all other text filters the current folder live, as before.
+
+## Help overlay keys
+
+The help overlay (`help`, `?`) takes the keyboard focus while it is open.
+
+- Key events go through the user keymap. In the overlay, the movement actions scroll the overlay: `cursor_down` and `cursor_up` (one line), `half_page_down` and `half_page_up`, `page_down` and `page_up`, `cursor_top` and `cursor_bottom`. Scrolling uses the smooth scroll rules below.
+- `cancel`, `help`, and the key `q` close the overlay. `quit` still quits. The overlay ignores all other actions.
+- The mouse wheel also scrolls the overlay.
+- SHOULD: `/` in the overlay focuses a small filter field at the top. The filter matches the keys, the action names, and the descriptions.
+
+## Smooth scroll (vim rules)
+
+The page actions follow vim. The view and the cursor move together, so the cursor keeps its row on the screen.
+
+- `half_page_down`: `n = max(1, visible_rows / 2)`. The view scrolls down by `min(n, rows left below the view)`. The cursor moves down by `n`, clamped to the last entry. `half_page_up` is the same in the other direction.
+- `page_down` and `page_up`: the same rule with `n = max(1, visible_rows - 2)`.
+- `cursor_top` and `cursor_bottom`: the view and the cursor go to the start or the end, with the same animation.
+- `cursor_down` and `cursor_up` (`j`, `k`, arrows) do not animate. When the cursor reaches the 2-row margin, the view scrolls by one row at once. Key repeat stays crisp.
+- New default keys: `ctrl+f` (`page_down`) and `ctrl+b` (`page_up`), like vim.
+
+Animation:
+
+- One animation driver (a display link, or a 120 Hz timer as a fallback) moves the scroll position of the clip view and the y position of the cursor highlight from their current values to the targets. The curve is ease-out (cubic).
+- The pane cursor (the logical cursor) changes at once. So `open`, Quick Look, `trash`, and all other actions use the target entry.
+- A new scroll action during an animation starts from the current animated position (a retarget). There is no queue and no jump back.
+- Any other key, a mouse scroll, a window resize, a directory change, or a filter change ends the animation at its target at once.
+- During the animation, the list draws the highlight at the animated position. It draws the row text in the normal colors, then clips to the highlight and draws the text again in the selection colors. So the text under the moving highlight stays readable.
+- One animation frame costs less than 2 ms. The view redraws only the changed areas.
+- When the macOS setting Reduce Motion is on (`accessibilityDisplayShouldReduceMotion`), nothing animates.
+- Config: `smooth-scroll = true`, `smooth-scroll-duration = 150` (milliseconds, 0 to 1000; 0 turns the animation off).
+
+The scroll arithmetic is a pure function in bf-core (for example a `viewport` module), with unit tests for the edges: the first and last rows, short lists, and a list shorter than the view.
+
 ## Default keys added
 
 | Keys | Action | Note |
