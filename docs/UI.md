@@ -169,6 +169,35 @@ Animation:
 
 The scroll arithmetic is a pure function in bf-core (for example a `viewport` module), with unit tests for the edges: the first and last rows, short lists, and a list shorter than the view.
 
+## Volumes and eject
+
+### Locations list
+
+- The Locations group shows the boot volume, external disks, disk images, and network shares (the mounted volumes that are not hidden). iCloud Drive and the Trash stay at their places.
+- Each volume except the boot volume (`NSURLVolumeIsRootFileSystemKey`) has an eject button (SF Symbol `eject`, secondary color) at the trailing edge of its row, like Finder. A click on the button ejects that volume.
+- The list updates on the `NSWorkspace` mount, unmount, and rename notifications. A new volume shows within 1 s after macOS mounts it. Read the volume list on a background thread.
+- When a volume unmounts for any reason (our eject, an eject in Finder, a disconnected cable):
+  - If the current folder is on that volume, the app goes to the home folder and shows `"X" was ejected`.
+  - Quick Look closes when it shows a file on that volume. A rename or new-folder prompt on that volume cancels.
+  - SHOULD: the back and forward history forgets the folders on that volume.
+
+### The eject action
+
+- Action `eject`. Default key `cmd+e`, like Finder. It never runs on key repeat.
+- The target, in this order:
+  1. When the sidebar has the focus: the selected Locations row.
+  2. The entry under the cursor, when it is the mount point of a volume that is not the boot volume (for example in `/Volumes`).
+  3. The volume of the current folder, when it is not the boot volume.
+  4. Else the message `Nothing to eject here`.
+- Steps:
+  1. When the current folder is on the target volume, go to the home folder first. Stop the directory watcher stream on the volume, and close Quick Look when it shows a file on the volume. So Better Finder itself does not keep the volume busy.
+  2. Show `Ejecting "X"...` until the result comes.
+  3. On a background thread, call `NSWorkspace unmountAndEjectDeviceAtURL:error:`. It unmounts all volumes of the same device, like Finder. It can take seconds, so it never runs on the main thread.
+  4. Success: show `Ejected "X"`. The unmount notification updates the sidebar.
+  5. The volume is busy (for example `EBUSY`): on a background thread, find the processes with open files on the volume (`lsof -F pc +f -- <mount point>`, 3 s timeout). Show `"X" is in use by <app names>. Press <eject key> again within 5 s to force the eject. Unsaved data in those apps can be lost.` The key text comes from the user keymap.
+  6. A second `eject` of the same volume within 5 s forces the eject (`diskutil unmount force <mount point>`, then `diskutil eject <mount point>` for a disk), on a background thread.
+  7. Other failures: `Cannot eject "X": <reason>`.
+
 ## Default keys added
 
 | Keys | Action | Note |
@@ -176,6 +205,7 @@ The scroll arithmetic is a pure function in bf-core (for example a `viewport` mo
 | `cmd+ctrl+s` | `toggle_sidebar` | Finder |
 | `tab` | `focus_sidebar` | |
 | `cmd+f` | `filter` | Finder search |
+| `cmd+e` | `eject` | Finder |
 | `cmd+shift+h` | `goto:~` | Finder |
 | `cmd+shift+d` | `goto:~/Desktop` | Finder |
 | `cmd+shift+o` | `goto:~/Documents` | Finder |
