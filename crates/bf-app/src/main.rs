@@ -7,6 +7,7 @@
 mod app;
 mod columns;
 mod debug;
+mod editor;
 mod file_ops;
 mod goto_panel;
 mod header;

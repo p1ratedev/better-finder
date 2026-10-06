@@ -7,7 +7,7 @@
 
 use std::ffi::OsStr;
 use std::fs::Metadata;
-use std::io;
+use std::io::{self, Read as _};
 use std::os::macos::fs::MetadataExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Component, Path, PathBuf};
@@ -209,6 +209,34 @@ fn has_package_extension(name: &str) -> bool {
     }
 }
 
+/// The number of bytes that `is_text_file` reads.
+const TEXT_PROBE_LEN: usize = 8192;
+
+/// Is the file a text file? The check reads the first 8192 bytes.
+/// A text file has no NUL byte and holds valid UTF-8. An empty file is text.
+/// The cut at the end of the probe may split a multibyte character. That is allowed.
+/// Any I/O error gives `false`, for example for a directory.
+pub fn is_text_file(path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = Vec::with_capacity(TEXT_PROBE_LEN);
+    if file
+        .take(TEXT_PROBE_LEN as u64)
+        .read_to_end(&mut buf)
+        .is_err()
+    {
+        return false;
+    }
+    if buf.contains(&0) {
+        return false;
+    }
+    match std::str::from_utf8(&buf) {
+        Ok(_) => true,
+        Err(e) => e.error_len().is_none() && buf.len() == TEXT_PROBE_LEN,
+    }
+}
+
 /// Expands user input to an absolute path:
 /// - `~` and `~/x` use the home directory.
 /// - A relative path joins to `cwd`.
@@ -293,6 +321,55 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::symlink;
+
+    fn text_probe(bytes: &[u8]) -> bool {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        fs::write(&path, bytes).unwrap();
+        is_text_file(&path)
+    }
+
+    #[test]
+    fn text_file_accepts_ascii_and_utf8() {
+        assert!(text_probe(b"hello\nworld\n"));
+        assert!(text_probe("caf\u{e9} \u{4e16}\u{754c}\n".as_bytes()));
+    }
+
+    #[test]
+    fn text_file_accepts_an_empty_file() {
+        assert!(text_probe(b""));
+    }
+
+    #[test]
+    fn text_file_rejects_a_nul_byte() {
+        assert!(!text_probe(b"ab\0cd"));
+    }
+
+    #[test]
+    fn text_file_rejects_invalid_utf8() {
+        assert!(!text_probe(b"ab\xe9cd"));
+    }
+
+    #[test]
+    fn text_file_accepts_a_cut_at_a_character_boundary() {
+        let mut bytes = vec![b'a'; TEXT_PROBE_LEN - 1];
+        bytes.extend("\u{e9}".as_bytes());
+        bytes.extend(b"tail");
+        assert!(bytes.len() > TEXT_PROBE_LEN);
+        assert!(text_probe(&bytes));
+    }
+
+    #[test]
+    fn text_file_rejects_a_short_incomplete_sequence() {
+        assert!(!text_probe(b"ab\xc3"));
+    }
+
+    #[test]
+    fn text_file_rejects_a_directory_and_a_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!is_text_file(dir.path()));
+        assert!(!is_text_file(&dir.path().join("missing")));
+    }
 
     fn find<'a>(entries: &'a [Entry], name: &str) -> &'a Entry {
         entries

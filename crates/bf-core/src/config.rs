@@ -274,6 +274,9 @@ pub struct Config {
     pub start_directory: Option<PathBuf>,
     /// `terminal`: the app name for `open_terminal`. Default: `Terminal`.
     pub terminal: String,
+    /// `editor`: the command that opens text files in a new terminal window.
+    /// Default: empty. Empty means: open text files with the default app.
+    pub editor: String,
     /// `auto-refresh`: reload the directory when it changes on disk. Default: `true`.
     pub auto_refresh: bool,
     /// `keybind`, repeatable. Default: `Keymap::default()`.
@@ -343,6 +346,7 @@ impl Default for Config {
             filter_mode: FilterMode::default(),
             start_directory: None,
             terminal: DEFAULT_TERMINAL.to_string(),
+            editor: String::new(),
             auto_refresh: true,
             keymap: Keymap::default(),
             sidebar: true,
@@ -623,6 +627,16 @@ impl Config {
                 } else {
                     value.to_string()
                 }
+            }
+            "editor" => {
+                if value.contains('\'') {
+                    return Err("invalid editor: it must not contain '".to_string());
+                }
+                self.editor = if empty {
+                    String::new()
+                } else {
+                    value.to_string()
+                };
             }
             "sidebar" => self.sidebar = if empty { true } else { boolean(key, value)? },
             "sidebar-width" => {
@@ -1009,6 +1023,15 @@ const TEMPLATE_SECTIONS: &[(&str, &[TemplateKey])] = &[
                 "terminal",
                 "Terminal",
                 &["The app that the open_terminal action starts."],
+            ),
+            tk(
+                "editor",
+                "",
+                &[
+                    "The command that opens text files, for example nvim.",
+                    "It runs in a new window of the terminal app: Ghostty or Terminal.",
+                    "Empty means: open text files with the default app.",
+                ],
             ),
             tk(
                 "auto-refresh",
@@ -1484,6 +1507,35 @@ mod tests {
     }
 
     #[test]
+    fn editor_defaults_to_empty() {
+        let (c, d) = parse("");
+        assert!(d.is_empty());
+        assert_eq!(c.editor, "");
+    }
+
+    #[test]
+    fn editor_takes_a_value() {
+        let (c, d) = parse("editor = nvim\n");
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!(c.editor, "nvim");
+    }
+
+    #[test]
+    fn empty_editor_resets() {
+        let (c, d) = parse("editor = nvim\neditor =\n");
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!(c.editor, "");
+    }
+
+    #[test]
+    fn editor_with_a_single_quote_is_rejected() {
+        let (c, d) = parse("editor = it's\n");
+        assert_eq!(d.len(), 1);
+        assert!(d[0].message.contains("invalid editor"));
+        assert_eq!(c.editor, "");
+    }
+
+    #[test]
     fn parse_str_rejects_config_file() {
         let (_, diags) = parse("font-size = 14\nconfig-file = other\n");
         assert_eq!(diags.len(), 1);
@@ -1683,6 +1735,7 @@ mod tests {
             "filter-mode",
             "start-directory",
             "terminal",
+            "editor",
             "auto-refresh",
             "sidebar",
             "sidebar-width",
