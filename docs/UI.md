@@ -143,6 +143,7 @@ The help overlay (`help`, `?`) takes the keyboard focus while it is open.
 
 - Key events go through the user keymap. In the overlay, the movement actions scroll the overlay: `cursor_down` and `cursor_up` (one line), `half_page_down` and `half_page_up`, `page_down` and `page_up`, `cursor_top` and `cursor_bottom`. Scrolling uses the smooth scroll rules below.
 - `cancel`, `help`, and the key `q` close the overlay. `quit` still quits. The overlay ignores all other actions.
+- When the overlay closes, the keyboard focus goes back to the view that had it before: the list or the sidebar. The app reads the focus before it hides the overlay, because AppKit gives the focus of a hidden view to the window.
 - The mouse wheel also scrolls the overlay.
 - SHOULD: `/` in the overlay focuses a small filter field at the top. The filter matches the keys, the action names, and the descriptions.
 
@@ -168,6 +169,15 @@ Animation:
 - Config: `smooth-scroll = true`, `smooth-scroll-duration = 150` (milliseconds, 0 to 1000; 0 turns the animation off).
 
 The scroll arithmetic is a pure function in bf-core (for example a `viewport` module), with unit tests for the edges: the first and last rows, short lists, and a list shorter than the view.
+
+## Drag and drop
+
+### Drag out of the list
+
+- A drag of a row starts when the mouse moves 4 pt or more from a single click. A double click does not start a drag.
+- The drag item is the file URL of the entry. The drag pasteboard gets `public.file-url`, `NSFilenamesPboardType`, and the URL types, like a drag from Finder. So Finder, Telegram, Mail, and browsers accept the drop.
+- The drag picture is the icon and the name of the row in the normal colors. Without a picture, the drag shows the file icon.
+- The list offers copy, move, link, and generic. The app that gets the drop chooses one: Finder moves the file on the same volume and copies it to another volume, and the option key forces a copy.
 
 ## Volumes and eject
 

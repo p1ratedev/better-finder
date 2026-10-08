@@ -5,7 +5,8 @@
 //!   the toolbar and the column header: `inset_top` is the height that they
 //!   cover, and the scroll code keeps the cursor below it.
 //! - It converts key events to `bf_core::KeyEvent` and sends them to the keymap.
-//! - It handles the mouse.
+//! - It handles the mouse. A drag of a row gives its file URL to other apps
+//!   (Finder, Telegram, Mail), like a drag from Finder.
 //! - It is the controller of the Quick Look panel (it is in the responder chain).
 //! - It hosts the inline rename field.
 //! - During a smooth scroll, a small subview (`HighlightView`) shows the
@@ -22,11 +23,16 @@ use bf_core::keymap::{Key, Mods, NamedKey};
 use bf_core::viewport::Viewport;
 use bf_core::{Entry, KeyEvent};
 use objc2::rc::Retained;
-use objc2::{ClassType, DefinedClass, MainThreadOnly, define_class, msg_send};
+use objc2::runtime::{AnyObject, ProtocolObject};
+use objc2::{AnyThread, ClassType, DefinedClass, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
-    NSBezierPath, NSEvent, NSEventModifierFlags, NSResponder, NSStringDrawing, NSView,
+    NSBezierPath, NSDragOperation, NSDraggingContext, NSDraggingItem, NSDraggingSession,
+    NSDraggingSource, NSEvent, NSEventModifierFlags, NSImage, NSResponder, NSStringDrawing, NSView,
+    NSWorkspace,
 };
-use objc2_foundation::{MainThreadMarker, NSObject, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{
+    MainThreadMarker, NSArray, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSURL,
+};
 use objc2_quick_look_ui::QLPreviewPanel;
 
 use crate::app::{self, AppState};
@@ -59,11 +65,20 @@ pub struct ListIvars {
     rows: Cell<usize>,
     /// The height at the top that the toolbar and the column header cover.
     inset_top: Cell<f64>,
+    /// The window point and the row of the last single click. A drag of
+    /// the mouse from this point starts a drag of the row.
+    drag_start: Cell<Option<(NSPoint, usize)>>,
 }
 
 thread_local! {
     static FIRST_FRAME: Cell<bool> = const { Cell::new(false) };
+    /// True while the list draws the picture of a drag: all rows draw in
+    /// the normal colors.
+    static DRAG_PICTURE: Cell<bool> = const { Cell::new(false) };
 }
+
+/// The distance in points that the mouse moves before a drag starts.
+const DRAG_THRESHOLD: f64 = 4.0;
 
 define_class!(
     // SAFETY:
@@ -123,10 +138,28 @@ define_class!(
             if let Some(window) = self.window() {
                 window.makeFirstResponder(Some(self.as_responder()));
             }
+            self.ivars().drag_start.set(None);
             let row_height = self.ivars().row_height.get();
             if point.y >= 0.0 && row_height > 0.0 {
-                app::click_row((point.y / row_height) as usize, event.clickCount() >= 2);
+                let row = (point.y / row_height) as usize;
+                let double = event.clickCount() >= 2;
+                if !double {
+                    self.ivars()
+                        .drag_start
+                        .set(Some((event.locationInWindow(), row)));
+                }
+                app::click_row(row, double);
             }
+        }
+
+        #[unsafe(method(mouseDragged:))]
+        fn mouse_dragged(&self, event: &NSEvent) {
+            self.drag_if_moved(event);
+        }
+
+        #[unsafe(method(mouseUp:))]
+        fn mouse_up(&self, _event: &NSEvent) {
+            self.ivars().drag_start.set(None);
         }
 
         #[unsafe(method(scrollWheel:))]
@@ -157,6 +190,19 @@ define_class!(
         #[unsafe(method(endPreviewPanelControl:))]
         fn end_preview_panel_control(&self, panel: Option<&QLPreviewPanel>) {
             quicklook::end_control(panel);
+        }
+    }
+
+    unsafe impl NSObjectProtocol for ListView {}
+
+    unsafe impl NSDraggingSource for ListView {
+        #[unsafe(method(draggingSession:sourceOperationMaskForDraggingContext:))]
+        fn source_operation_mask(
+            &self,
+            _session: &NSDraggingSession,
+            context: NSDraggingContext,
+        ) -> NSDragOperation {
+            drag_operations(context)
         }
     }
 );
@@ -217,6 +263,7 @@ impl ListView {
             row_height: Cell::new(20.0),
             rows: Cell::new(0),
             inset_top: Cell::new(0.0),
+            drag_start: Cell::new(None),
         });
         // SAFETY: `initWithFrame:` is the designated initializer of NSView.
         unsafe { msg_send![super(this), initWithFrame: frame] }
@@ -454,7 +501,9 @@ impl ListView {
             free,
             dirty,
             active: self.is_active(),
-            animating: smooth::list_highlight().is_some(),
+            // The picture of a drag shows the rows in the normal colors,
+            // like a smooth scroll.
+            animating: smooth::list_highlight().is_some() || DRAG_PICTURE.get(),
             scale: self.window().map_or(2.0, |w| w.backingScaleFactor()),
             needs: &needs,
         };
@@ -471,6 +520,93 @@ impl ListView {
             );
         }
     }
+}
+
+impl ListView {
+    /// Starts a drag of the clicked row when the mouse moved far enough
+    /// from the click. The drag item is the file URL of the entry.
+    fn drag_if_moved(&self, event: &NSEvent) {
+        let Some((start, row)) = self.ivars().drag_start.get() else {
+            return;
+        };
+        let now = event.locationInWindow();
+        if (now.x - start.x).hypot(now.y - start.y) < DRAG_THRESHOLD {
+            return;
+        }
+        self.ivars().drag_start.set(None);
+        let width = self.bounds().size.width;
+        // The click put the cursor on the row. A reload can change the
+        // rows before the drag: then the drag does not start.
+        let info = app::with_ref(|s| {
+            let entry = s
+                .pane
+                .visible_entry(row)
+                .filter(|_| s.pane.cursor() == row)?;
+            Some((entry.path.clone(), s.style.layout(width).name_end))
+        })
+        .flatten();
+        let Some((path, name_end)) = info else {
+            return;
+        };
+        let Some(url) = NSURL::from_file_path(&path) else {
+            return;
+        };
+        let item = NSDraggingItem::initWithPasteboardWriter(
+            NSDraggingItem::alloc(),
+            ProtocolObject::from_ref(&*url),
+        );
+        let row_rect = self.row_rect(row);
+        let frame = NSRect::new(
+            NSPoint::new(LEFT_PAD - 4.0, row_rect.origin.y),
+            NSSize::new(
+                (name_end - LEFT_PAD + 4.0).max(row_rect.size.height),
+                row_rect.size.height,
+            ),
+        );
+        let (frame, image) = match self.drag_picture(frame) {
+            Some(image) => (frame, image),
+            None => {
+                // No picture of the row: the file icon at the icon place.
+                let size = row_rect.size.height;
+                let path = NSString::from_str(&path.to_string_lossy());
+                let icon = NSWorkspace::sharedWorkspace().iconForFile(&path);
+                (NSRect::new(frame.origin, NSSize::new(size, size)), icon)
+            }
+        };
+        let contents: &AnyObject = &image;
+        // SAFETY: The contents of a dragging item can be an `NSImage`.
+        unsafe { item.setDraggingFrame_contents(frame, Some(contents)) };
+        let items = NSArray::from_retained_slice(&[item]);
+        trace!("drag: {}", path.display());
+        self.beginDraggingSessionWithItems_event_source(
+            &items,
+            event,
+            ProtocolObject::from_ref(self),
+        );
+    }
+
+    /// A picture of the list in `rect` (the icon and the name of a row),
+    /// in the normal colors.
+    fn drag_picture(&self, rect: NSRect) -> Option<Retained<NSImage>> {
+        let rep = self.bitmapImageRepForCachingDisplayInRect(rect)?;
+        DRAG_PICTURE.set(true);
+        self.cacheDisplayInRect_toBitmapImageRep(rect, &rep);
+        DRAG_PICTURE.set(false);
+        let image = NSImage::initWithSize(NSImage::alloc(), rect.size);
+        image.addRepresentation(&rep);
+        Some(image)
+    }
+}
+
+/// The operations that a drag from the list offers. The app that gets the
+/// drop chooses one, like for a drag from Finder: Finder moves the file on
+/// the same volume and copies it to another volume, and the option key
+/// forces a copy. The app itself has no drop target.
+fn drag_operations(context: NSDraggingContext) -> NSDragOperation {
+    if context == NSDraggingContext::WithinApplication {
+        return NSDragOperation::None;
+    }
+    NSDragOperation::Copy | NSDragOperation::Link | NSDragOperation::Generic | NSDragOperation::Move
 }
 
 /// Converts a key-down `NSEvent` and sends it to the keymap. True when the

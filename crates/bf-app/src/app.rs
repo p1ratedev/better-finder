@@ -1056,15 +1056,17 @@ fn show_help(ui: &Ui, height: Option<f64>) {
     if visible != was_visible {
         smooth::finish();
     }
-    ui.root.set_help(visible, height.unwrap_or(0.0));
-    ui.help.view.setNeedsDisplay(true);
-    let help_responder: &NSResponder = ui.help.view.as_super().as_super();
+    // Read the focus before the overlay hides: AppKit gives the focus of a
+    // hidden view to the window.
     let help_first = ui.window.firstResponder().is_some_and(|r| {
         std::ptr::eq(
             Retained::as_ptr(&r).cast::<u8>(),
             Retained::as_ptr(&ui.help.view).cast::<u8>(),
         )
     });
+    ui.root.set_help(visible, height.unwrap_or(0.0));
+    ui.help.view.setNeedsDisplay(true);
+    let help_responder: &NSResponder = ui.help.view.as_super().as_super();
     if visible && !was_visible {
         // A new overlay starts at the top.
         let clip = ui.help.scroll.contentView();
@@ -1072,10 +1074,40 @@ fn show_help(ui: &Ui, height: Option<f64>) {
         ui.help.scroll.reflectScrolledClipView(&clip);
     }
     if visible && !help_first {
+        HELP_RETURN.with(|r| *r.borrow_mut() = ui.window.firstResponder());
         ui.window.makeFirstResponder(Some(help_responder));
-    } else if !visible && help_first {
-        ui.window.makeFirstResponder(Some(list_responder(&ui.list)));
+    } else if !visible {
+        let before = HELP_RETURN.with(|r| r.borrow_mut().take());
+        if help_first {
+            ui.window
+                .makeFirstResponder(Some(focus_after_help(ui, before.as_deref())));
+        }
     }
+}
+
+thread_local! {
+    /// The responder that had the keyboard focus before the help overlay
+    /// opened.
+    static HELP_RETURN: RefCell<Option<Retained<NSResponder>>> = const { RefCell::new(None) };
+}
+
+/// The responder that gets the keyboard focus when the help overlay
+/// closes: the sidebar when it had the focus before and it is visible,
+/// else the list.
+fn focus_after_help<'a>(ui: &'a Ui, before: Option<&NSResponder>) -> &'a NSResponder {
+    let outline = &ui.sidebar.outline;
+    let was_sidebar = before.is_some_and(|r| {
+        std::ptr::eq(
+            (r as *const NSResponder).cast::<u8>(),
+            Retained::as_ptr(outline).cast::<u8>(),
+        )
+    });
+    if was_sidebar && !outline.isHiddenOrHasHiddenAncestor() {
+        trace!("help: the focus goes back to the sidebar");
+        return outline.as_super().as_super().as_super().as_super();
+    }
+    trace!("help: the focus goes back to the list");
+    list_responder(&ui.list)
 }
 
 /// Shows the text input of `place` and moves the keyboard focus to it.
