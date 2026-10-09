@@ -15,6 +15,7 @@
 //! its app panel), Share, and the Services of the list.
 
 use std::cell::{Cell, OnceCell, RefCell};
+use std::collections::HashSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -400,15 +401,18 @@ fn fill_open_with(b: &mut Builder, menu: &NSMenu, path: &Path) {
     let default = workspace
         .URLForApplicationToOpenURL(&url)
         .and_then(|u| u.to_file_path());
+    // One item for each app name, like Finder: a Mac can have many copies
+    // of an app (for example versioned builds). The first copy that Launch
+    // Services gives stays.
+    let mut names: HashSet<String> = default.as_deref().map(app_name).into_iter().collect();
     let mut others: Vec<(String, PathBuf)> = workspace
         .URLsForApplicationsToOpenURL(&url)
         .iter()
         .filter_map(|u| u.to_file_path())
-        .filter(|app| Some(app) != default.as_ref())
         .map(|app| (app_name(&app), app))
+        .filter(|(name, _)| names.insert(name.clone()))
         .collect();
-    others.sort_by(|a, b| bf_core::sort::natural_cmp(&a.0, &b.0).then(a.1.cmp(&b.1)));
-    others.dedup_by(|a, b| a.1 == b.1);
+    others.sort_by(|a, b| bf_core::sort::natural_cmp(&a.0, &b.0));
     let mut groups = 0;
     if let Some(app) = default {
         let title = format!("{} (default)", app_name(&app));
