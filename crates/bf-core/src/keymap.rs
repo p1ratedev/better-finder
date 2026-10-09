@@ -408,6 +408,11 @@ pub const DEFAULT_BINDINGS: &[&str] = &[
     "c>c=copy_path",
     "c>n=copy_name",
     "cmd+alt+c=copy_path",
+    "cmd+c=copy",
+    "cmd+v=paste",
+    "cmd+d=duplicate",
+    "cmd+ctrl+a=make_alias",
+    "cmd+i=get_info",
     "T=open_terminal",
     "cmd+e=eject",
     // App
