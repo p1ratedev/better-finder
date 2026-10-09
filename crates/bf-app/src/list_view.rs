@@ -9,6 +9,9 @@
 //!   (Finder, Telegram, Mail), like a drag from Finder. A right click or a
 //!   control click shows the context menu (`context_menu`).
 //! - It gives the entry under the cursor to the macOS Services.
+//! - It takes drops of files: on a folder row (into the folder), on an app
+//!   row (open with the app), or on the other rows and the empty space
+//!   (into the current folder). `bf_core::drop` has the Finder rules.
 //! - It is the controller of the Quick Look panel (it is in the responder chain).
 //! - It hosts the inline rename field.
 //! - During a smooth scroll, a small subview (`HighlightView`) shows the
@@ -18,18 +21,23 @@
 //!   text under the moving highlight stays readable, and a frame redraws
 //!   only the subview and the rows that the scroll shows.
 
-use std::cell::{Cell, OnceCell};
+use std::cell::{Cell, OnceCell, RefCell};
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
+use bf_core::drop::{self, Offered};
 use bf_core::keymap::{Key, Mods, NamedKey};
+use bf_core::transfer::TransferMode;
 use bf_core::viewport::Viewport;
 use bf_core::{Entry, KeyEvent};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{AnyThread, ClassType, DefinedClass, MainThreadOnly, Message, define_class, msg_send};
 use objc2_app_kit::{
-    NSBezierPath, NSDragOperation, NSDraggingContext, NSDraggingItem, NSDraggingSession,
-    NSDraggingSource, NSEvent, NSEventModifierFlags, NSImage, NSMenu, NSPasteboard, NSResponder,
+    NSBezierPath, NSColor, NSDragOperation, NSDraggingContext, NSDraggingDestination,
+    NSDraggingInfo, NSDraggingItem, NSDraggingSession, NSDraggingSource, NSEvent,
+    NSEventModifierFlags, NSImage, NSMenu, NSPasteboard, NSPasteboardTypeFileURL, NSResponder,
     NSStringDrawing, NSView, NSWorkspace,
 };
 use objc2_foundation::{
@@ -41,6 +49,7 @@ use crate::app::{self, AppState};
 use crate::columns;
 use crate::context_menu;
 use crate::debug::trace;
+use crate::file_ops;
 use crate::icons;
 use crate::quicklook;
 use crate::smooth;
@@ -71,6 +80,34 @@ pub struct ListIvars {
     /// The window point and the row of the last single click. A drag of
     /// the mouse from this point starts a drag of the row.
     drag_start: Cell<Option<(NSPoint, usize)>>,
+    /// Where a drop goes now, during a drag over the list. The list draws
+    /// a ring there.
+    drop_place: Cell<Option<DropPlace>>,
+    /// The files of the current drag over the list: the drag sequence
+    /// number and the resolved paths. A drag reads its pasteboard once.
+    drop_files: RefCell<Option<(isize, Vec<PathBuf>)>>,
+}
+
+/// Where a drop goes in the list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DropPlace {
+    /// The folder or the app on this row.
+    Row(usize),
+    /// The current folder: the whole list.
+    List,
+}
+
+/// What a drop at the drag location does.
+struct DropPlan {
+    place: DropPlace,
+    target: DropTarget,
+}
+
+enum DropTarget {
+    /// Copy, move, or make aliases in this folder (a resolved path).
+    Folder(PathBuf, TransferMode),
+    /// Open the files with this app.
+    App(PathBuf),
 }
 
 thread_local! {
@@ -227,6 +264,34 @@ define_class!(
 
     unsafe impl NSObjectProtocol for ListView {}
 
+    unsafe impl NSDraggingDestination for ListView {
+        #[unsafe(method(draggingEntered:))]
+        fn dragging_entered(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> NSDragOperation {
+            self.drop_update(sender)
+        }
+
+        #[unsafe(method(draggingUpdated:))]
+        fn dragging_updated(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> NSDragOperation {
+            self.drop_update(sender)
+        }
+
+        #[unsafe(method(draggingExited:))]
+        fn dragging_exited(&self, _sender: Option<&ProtocolObject<dyn NSDraggingInfo>>) {
+            self.set_drop_place(None);
+        }
+
+        #[unsafe(method(performDragOperation:))]
+        fn perform_drag_operation(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> bool {
+            self.drop_perform(sender)
+        }
+
+        #[unsafe(method(draggingEnded:))]
+        fn dragging_ended(&self, _sender: &ProtocolObject<dyn NSDraggingInfo>) {
+            self.set_drop_place(None);
+            self.ivars().drop_files.replace(None);
+        }
+    }
+
     unsafe impl NSDraggingSource for ListView {
         #[unsafe(method(draggingSession:sourceOperationMaskForDraggingContext:))]
         fn source_operation_mask(
@@ -296,9 +361,15 @@ impl ListView {
             rows: Cell::new(0),
             inset_top: Cell::new(0.0),
             drag_start: Cell::new(None),
+            drop_place: Cell::new(None),
+            drop_files: RefCell::new(None),
         });
         // SAFETY: `initWithFrame:` is the designated initializer of NSView.
-        unsafe { msg_send![super(this), initWithFrame: frame] }
+        let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
+        // SAFETY: `NSPasteboardTypeFileURL` is an immutable static from AppKit.
+        let file_url = unsafe { NSPasteboardTypeFileURL };
+        this.registerForDraggedTypes(&NSArray::from_slice(&[file_url]));
+        this
     }
 
     fn as_responder(&self) -> &NSResponder {
@@ -540,6 +611,9 @@ impl ListView {
             needs: &needs,
         };
         let drawn = app::with_ref(|s| draw_list(s, &input)).flatten();
+        if let Some(place) = self.ivars().drop_place.get() {
+            draw_drop_ring(self.drop_rect(place));
+        }
         smooth::note_draw(started.elapsed());
         let Some(rows) = drawn else { return };
         // The draw put paths in the icon queue. Get their icons after the frame.
@@ -630,15 +704,201 @@ impl ListView {
     }
 }
 
+impl ListView {
+    /// A drag moved over the list: find the drop place, show it, and
+    /// give the operation of a drop there.
+    fn drop_update(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> NSDragOperation {
+        let plan = self.drop_plan(sender);
+        self.set_drop_place(plan.as_ref().map(|p| p.place));
+        let mask = sender.draggingSourceOperationMask();
+        match plan.map(|p| p.target) {
+            Some(DropTarget::Folder(_, mode)) => drop_operation(mode),
+            Some(DropTarget::App(_)) => app_drop_operation(mask),
+            None => NSDragOperation::None,
+        }
+    }
+
+    /// The drop: start the copy, the move, or the open.
+    fn drop_perform(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> bool {
+        let plan = self.drop_plan(sender);
+        let files = self.dragged_files(sender);
+        self.set_drop_place(None);
+        let Some(plan) = plan else {
+            return false;
+        };
+        match plan.target {
+            DropTarget::Folder(dest, mode) => file_ops::transfer(files, dest, mode),
+            DropTarget::App(path) => context_menu::open_with(&files, &path),
+        }
+        true
+    }
+
+    /// What a drop at the drag location does, or `None` when a drop does
+    /// nothing there. A folder row takes the files. An app row opens them.
+    /// Other rows and the empty space give them to the current folder.
+    fn drop_plan(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> Option<DropPlan> {
+        let files = self.dragged_files(sender);
+        if files.is_empty() {
+            return None;
+        }
+        let offered = offered(sender.draggingSourceOperationMask());
+        let point = self.convertPoint_fromView(sender.draggingLocation(), None);
+        let h = self.ivars().row_height.get();
+        // The toolbar and the column header cover the top of the list.
+        let row = (point.y >= self.free_rect().origin.y && h > 0.0).then(|| (point.y / h) as usize);
+        let (on_row, cwd) = app::with_ref(|s| {
+            let on_row = row.and_then(|row| {
+                let e = s.pane.visible_entry(row)?;
+                let is_app = e.is_package && e.extension().eq_ignore_ascii_case("app");
+                Some((row, e.path.clone(), e.is_dir, is_app))
+            });
+            (on_row, s.pane.cwd().to_path_buf())
+        })?;
+        if let Some((row, path, is_dir, is_app)) = on_row {
+            let place = DropPlace::Row(row);
+            let resolved = std::fs::canonicalize(&path).ok();
+            let dragged = resolved.as_ref().is_some_and(|p| files.contains(p));
+            if is_app && !dragged {
+                let target = DropTarget::App(path);
+                return Some(DropPlan { place, target });
+            }
+            if let Some((dest, mode)) = is_dir
+                .then(|| folder_drop(&files, &path, offered))
+                .flatten()
+            {
+                let target = DropTarget::Folder(dest, mode);
+                return Some(DropPlan { place, target });
+            }
+        }
+        let (dest, mode) = folder_drop(&files, &cwd, offered)?;
+        let target = DropTarget::Folder(dest, mode);
+        Some(DropPlan {
+            place: DropPlace::List,
+            target,
+        })
+    }
+
+    /// The resolved paths of the files of the current drag.
+    fn dragged_files(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> Vec<PathBuf> {
+        let number = sender.draggingSequenceNumber();
+        let cache = &self.ivars().drop_files;
+        if let Some((n, files)) = &*cache.borrow() {
+            if *n == number {
+                return files.clone();
+            }
+        }
+        let files = file_paths(&sender.draggingPasteboard());
+        cache.replace(Some((number, files.clone())));
+        files
+    }
+
+    /// Shows the ring at `place`, or no ring.
+    fn set_drop_place(&self, place: Option<DropPlace>) {
+        let old = self.ivars().drop_place.replace(place);
+        if old != place {
+            for p in [old, place].into_iter().flatten() {
+                self.setNeedsDisplayInRect(self.drop_rect(p));
+            }
+        }
+    }
+
+    fn drop_rect(&self, place: DropPlace) -> NSRect {
+        match place {
+            DropPlace::Row(row) => self.row_rect(row),
+            DropPlace::List => self.free_rect(),
+        }
+    }
+}
+
 /// The operations that a drag from the list offers. The app that gets the
 /// drop chooses one, like for a drag from Finder: Finder moves the file on
 /// the same volume and copies it to another volume, and the option key
-/// forces a copy. The app itself has no drop target.
-fn drag_operations(context: NSDraggingContext) -> NSDragOperation {
-    if context == NSDraggingContext::WithinApplication {
-        return NSDragOperation::None;
-    }
+/// forces a copy. The list itself is also a drop target (a move into a
+/// folder row).
+fn drag_operations(_context: NSDraggingContext) -> NSDragOperation {
     NSDragOperation::Copy | NSDragOperation::Link | NSDragOperation::Generic | NSDragOperation::Move
+}
+
+/// The operations that a drag source offers, for `bf_core::drop`.
+fn offered(mask: NSDragOperation) -> Offered {
+    Offered {
+        copy: mask.contains(NSDragOperation::Copy),
+        link: mask.contains(NSDragOperation::Link),
+        generic: mask.contains(NSDragOperation::Generic),
+        moves: mask.contains(NSDragOperation::Move),
+    }
+}
+
+/// The drag operation that shows the drop mode (the badge at the pointer).
+fn drop_operation(mode: TransferMode) -> NSDragOperation {
+    match mode {
+        TransferMode::Copy => NSDragOperation::Copy,
+        TransferMode::Move => NSDragOperation::Move,
+        TransferMode::Alias => NSDragOperation::Link,
+    }
+}
+
+/// The drag operation for a drop on an app: one that the source offers.
+fn app_drop_operation(mask: NSDragOperation) -> NSDragOperation {
+    [
+        NSDragOperation::Generic,
+        NSDragOperation::Copy,
+        NSDragOperation::Link,
+        NSDragOperation::Move,
+    ]
+    .into_iter()
+    .find(|op| mask.contains(*op))
+    .unwrap_or(NSDragOperation::None)
+}
+
+/// The resolved folder and the mode of a drop of `files` into `folder`,
+/// or `None` when the drop does nothing (`bf_core::drop::check`).
+fn folder_drop(
+    files: &[PathBuf],
+    folder: &Path,
+    offered: Offered,
+) -> Option<(PathBuf, TransferMode)> {
+    let dest = std::fs::canonicalize(folder).ok()?;
+    let volume = |p: &Path| std::fs::metadata(p).ok().map(|m| m.dev());
+    let dest_volume = volume(&dest);
+    let same_volume = dest_volume.is_some() && files.iter().all(|f| volume(f) == dest_volume);
+    let mode = drop::choose(offered, same_volume)?;
+    drop::check(files, &dest, mode).ok()?;
+    Some((dest, mode))
+}
+
+/// The resolved paths of the file URLs on `pasteboard`. Finder can give
+/// file reference URLs (`file:///.file/id=...`): `filePathURL` converts
+/// them to path URLs.
+fn file_paths(pasteboard: &NSPasteboard) -> Vec<PathBuf> {
+    // SAFETY: `NSPasteboardTypeFileURL` is an immutable static from AppKit.
+    let kind = unsafe { NSPasteboardTypeFileURL };
+    let Some(items) = pasteboard.pasteboardItems() else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let text = item.stringForType(kind)?;
+            let url = NSURL::URLWithString(&text)?.filePathURL()?;
+            std::fs::canonicalize(url.to_file_path()?).ok()
+        })
+        .collect()
+}
+
+/// The ring of a drop place: the accent color, 2 pt wide, like in Finder.
+fn draw_drop_ring(rect: NSRect) {
+    let ring = NSRect::new(
+        NSPoint::new(rect.origin.x + SELECTION_INSET + 1.0, rect.origin.y + 1.0),
+        NSSize::new(
+            (rect.size.width - 2.0 * SELECTION_INSET - 2.0).max(0.0),
+            (rect.size.height - 2.0).max(0.0),
+        ),
+    );
+    NSColor::controlAccentColor().setStroke();
+    let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(ring, 5.0, 5.0);
+    path.setLineWidth(2.0);
+    path.stroke();
 }
 
 /// Converts a key-down `NSEvent` and sends it to the keymap. True when the

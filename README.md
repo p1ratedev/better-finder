@@ -29,6 +29,7 @@ Finder is good with a mouse. It is slow with a keyboard. Better Finder keeps the
 - 🧈 **Smooth scroll, like nvim.** `ctrl+d` and `ctrl+u` move the view and the cursor together, with a short animation. `j` and `k` stay instant.
 - 📝 **One dotfile.** `~/.config/better-finder/config` uses the Ghostty syntax. The app reloads it when you save it.
 - 👀 **Native Quick Look.** Press `Space` to preview a file, like in Finder.
+- 🖱️ **Drag and drop.** Drag a file to Telegram, Mail, or Finder. Drop files on a folder row, on an app, or on the list. The Finder rules apply: a move on the same volume, `option` for a copy, `control` for an alias.
 - 🪟 **The Finder look.** A glass sidebar with Favorites and Locations, a toolbar, a column header that sorts, the Kind column, sizes and dates in your locale, and a path bar.
 - 💽 **Disks.** Disks, disk images, and network shares show in the sidebar when they mount. `cmd+e` ejects them.
 - 🖱️ **The Finder context menu.** A right click shows the Finder items: Open With, Duplicate, Make Alias, Compress, Copy and Paste of files, Get Info, Share, and the Services.
@@ -207,7 +208,7 @@ The numbers come from one Apple Silicon Mac, with `BETTER_FINDER_TRACE=1` and `f
 
 Better Finder follows the Ghostty model: a core library and a thin native shell.
 
-- **`bf-core`** is pure Rust, with no UI code: the config parser, the keymap, the directory listing, sort, filter, navigation state, the scroll math, and the names of new files. 167 unit tests cover it.
+- **`bf-core`** is pure Rust, with no UI code: the config parser, the keymap, the directory listing, sort, filter, navigation state, the scroll math, the names of new files, and the drop rules. 173 unit tests cover it.
 - **`bf-app`** is the native macOS app, written with AppKit through [`objc2`](https://github.com/madsmtm/objc2):
   - A custom list view draws only the visible rows, so a frame costs the same for 50 files or 100 000.
   - `Space` opens the real `QLPreviewPanel`.
@@ -219,7 +220,7 @@ The design contracts are in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [
 ## Roadmap
 
 - [ ] Multi-select, and cut and paste (a move) of files
-- [ ] Drag and drop to and from other apps
+- [x] Drag and drop to and from other apps
 - [ ] Tabs and split panes
 - [ ] A column view (Miller columns) with a preview column
 - [ ] Date groups (Today, Yesterday, Previous 7 Days) and a Date Added column

@@ -82,6 +82,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSDragging",
     "NSDraggingItem",
     "NSDraggingSession",
+    "NSPasteboardItem",
     "NSUserInterfaceValidation",
     "NSNib",
     "NSTableHeaderView",

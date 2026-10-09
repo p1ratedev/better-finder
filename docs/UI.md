@@ -179,6 +179,31 @@ The scroll arithmetic is a pure function in bf-core (for example a `viewport` mo
 - The drag picture is the icon and the name of the row in the normal colors. Without a picture, the drag shows the file icon.
 - The list offers copy, move, link, and generic. The app that gets the drop chooses one: Finder moves the file on the same volume and copies it to another volume, and the option key forces a copy.
 
+### Drop on the list
+
+The list takes drops of files (`public.file-url`) from Finder, from other apps, and from the list itself.
+
+| Drop place | What the drop does | Ring |
+| --- | --- | --- |
+| A folder row | Puts the files in that folder | Around the row |
+| An app row (`.app`) | Opens the files with that app | Around the row |
+| A file row, a package row, or the empty space | Puts the files in the current folder | Around the list |
+
+The mode follows Finder (`bf_core::drop::choose`):
+
+- No modifier key: a move on the same volume, a copy to another volume.
+- Option: a copy. Control: an alias. Command: a move.
+- A move to another volume copies the files and keeps the sources. The app never deletes a source after a copy.
+
+The drop does nothing (`bf_core::drop::check`) when:
+
+- it is a move into the folder that has the files already (for example a row on its own folder), or
+- it copies or moves a folder into itself or into one of its subfolders. A drop on the row of a dragged folder then goes to the current folder.
+
+The file work never replaces a file. A name conflict gives the Finder "Keep Both" name (`file 2.txt`). A copy into the same folder gives the duplicate name (`file copy.txt`). The work runs on a background thread, then the list reloads and the status bar shows the result.
+
+Later: drops on the sidebar, spring-loaded folders (a folder opens during a drag), and a scroll of the list at its edges during a drag.
+
 ## Volumes and eject
 
 ### Locations list

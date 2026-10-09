@@ -178,7 +178,7 @@ fn run(subject: Subject, command: Command) {
     match (command, subject) {
         (Command::Action(action), Subject::Entry(_)) => app::dispatch(action),
         (Command::Action(action), Subject::Folder(dir)) => app::dispatch_on(action, dir),
-        (Command::OpenWith(app_path), _) => open_with(&path, &app_path),
+        (Command::OpenWith(app_path), _) => open_with(&[path], &app_path),
         (Command::OpenWithOther, _) => choose_app(path),
     }
 }
@@ -488,14 +488,18 @@ fn folder_menu() -> Option<Retained<NSMenu>> {
     Some(b.finish(menu, Subject::Folder(cwd)))
 }
 
-/// Opens `file` with the app at `app`. An error shows in the status bar.
-fn open_with(file: &Path, app: &Path) {
-    let (Some(file_url), Some(app_url)) =
-        (NSURL::from_file_path(file), NSURL::from_directory_path(app))
-    else {
+/// Opens `files` with the app at `app` (Open With, or a drop on an app
+/// row). An error shows in the status bar.
+pub fn open_with(files: &[PathBuf], app: &Path) {
+    let file_urls: Vec<Retained<NSURL>> = files.iter().filter_map(NSURL::from_file_path).collect();
+    let (Some(first), Some(app_url)) = (files.first(), NSURL::from_directory_path(app)) else {
         return;
     };
-    let failure = format!("Cannot open \"{}\" with {}", file_name(file), app_name(app));
+    let what = match files {
+        [_] => format!("\"{}\"", file_name(first)),
+        _ => format!("{} items", files.len()),
+    };
+    let failure = format!("Cannot open {what} with {}", app_name(app));
     // AppKit calls the handler on a background queue. It only makes text
     // and sends it to the main queue.
     let handler = RcBlock::new(
@@ -509,7 +513,7 @@ fn open_with(file: &Path, app: &Path) {
     );
     let config = NSWorkspaceOpenConfiguration::configuration();
     NSWorkspace::sharedWorkspace().openURLs_withApplicationAtURL_configuration_completionHandler(
-        &NSArray::from_retained_slice(&[file_url]),
+        &NSArray::from_retained_slice(&file_urls),
         &app_url,
         &config,
         Some(&handler),
@@ -544,7 +548,7 @@ fn choose_app(file: PathBuf) {
             return;
         }
         if let Some(app) = chosen.URL().and_then(|u| u.to_file_path()) {
-            open_with(&file, &app);
+            open_with(std::slice::from_ref(&file), &app);
         }
     });
     panel.beginSheetModalForWindow_completionHandler(&window, &handler);

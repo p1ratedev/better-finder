@@ -9,6 +9,7 @@
 pub mod action;
 pub mod color;
 pub mod config;
+pub mod drop;
 pub mod filter;
 pub mod format;
 pub mod fs;

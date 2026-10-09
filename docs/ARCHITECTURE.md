@@ -50,6 +50,7 @@ This is the Ghostty model: a core library and a thin native shell. The shell con
 | `viewport` | Scroll arithmetic with the vim rules: half page, page, top, bottom, and the 2-row margin of line moves. Pure functions. |
 | `names` | New names for copies, aliases, and archives, like Finder: `report copy.pdf`, `file 2.txt`, `report.pdf alias`, `report.pdf.zip`. Pure functions. |
 | `transfer` | The rules of a copy, move, or alias into a folder: the name style, the "inside itself" test, and the status text. Pure functions. |
+| `drop` | The Finder rules of a drop: the transfer mode from the offered operations and the volumes, and the checks that stop a drop (a move into the same folder, a folder into itself). Pure functions. |
 
 The public API of `bf-core` is the contract with `bf-app`. The doc comments in the source are the specification.
 
@@ -60,7 +61,7 @@ The public API of `bf-core` is the contract with `bf-app`. The doc comments in t
 | `main` | CLI arguments. The `+` commands. Starts `NSApplication`. |
 | `app` | The app delegate, the main menu, the app state, the dispatch of actions. |
 | `window` | The `NSWindow`, the split view (sidebar and content), the column header, the list, the prompt, the path and status bar, and the help overlay. |
-| `list_view` | A custom `NSView` in an `NSScrollView`. It draws only the dirty rows. It handles keys and the mouse, and gives the context menu (`menuForEvent:`). It is the controller of the Quick Look panel. During a smooth scroll, a small subview shows the moving cursor highlight. |
+| `list_view` | A custom `NSView` in an `NSScrollView`. It draws only the dirty rows. It handles keys and the mouse, and gives the context menu (`menuForEvent:`). It is a drag source (a file URL for each dragged row) and a drop target (`bf_core::drop`, then `file_ops::transfer`). It is the controller of the Quick Look panel. During a smooth scroll, a small subview shows the moving cursor highlight. |
 | `columns` | The text of the list columns: size, Kind, and dates. It follows the locale, like Finder. |
 | `header` | The column header above the list. A click on a title sorts the list. |
 | `sidebar` | The sidebar (`NSOutlineView`, source list style) with Favorites and Locations. A background thread builds the model. A volume row has an eject button. |
