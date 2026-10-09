@@ -6,7 +6,9 @@
 //!   cover, and the scroll code keeps the cursor below it.
 //! - It converts key events to `bf_core::KeyEvent` and sends them to the keymap.
 //! - It handles the mouse. A drag of a row gives its file URL to other apps
-//!   (Finder, Telegram, Mail), like a drag from Finder.
+//!   (Finder, Telegram, Mail), like a drag from Finder. A right click or a
+//!   control click shows the context menu (`context_menu`).
+//! - It gives the entry under the cursor to the macOS Services.
 //! - It is the controller of the Quick Look panel (it is in the responder chain).
 //! - It hosts the inline rename field.
 //! - During a smooth scroll, a small subview (`HighlightView`) shows the
@@ -24,11 +26,11 @@ use bf_core::viewport::Viewport;
 use bf_core::{Entry, KeyEvent};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{AnyThread, ClassType, DefinedClass, MainThreadOnly, define_class, msg_send};
+use objc2::{AnyThread, ClassType, DefinedClass, MainThreadOnly, Message, define_class, msg_send};
 use objc2_app_kit::{
     NSBezierPath, NSDragOperation, NSDraggingContext, NSDraggingItem, NSDraggingSession,
-    NSDraggingSource, NSEvent, NSEventModifierFlags, NSImage, NSResponder, NSStringDrawing, NSView,
-    NSWorkspace,
+    NSDraggingSource, NSEvent, NSEventModifierFlags, NSImage, NSMenu, NSPasteboard, NSResponder,
+    NSStringDrawing, NSView, NSWorkspace,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSURL,
@@ -37,6 +39,7 @@ use objc2_quick_look_ui::QLPreviewPanel;
 
 use crate::app::{self, AppState};
 use crate::columns;
+use crate::context_menu;
 use crate::debug::trace;
 use crate::icons;
 use crate::quicklook;
@@ -170,6 +173,35 @@ define_class!(
             app::after_now(app::cancel_inline_rename);
             // SAFETY: NSResponder implements this method with this signature.
             let _: () = unsafe { msg_send![super(self), scrollWheel: event] };
+        }
+
+        #[unsafe(method_id(menuForEvent:))]
+        fn menu_for_event(&self, event: &NSEvent) -> Option<Retained<NSMenu>> {
+            let point = self.convertPoint_fromView(event.locationInWindow(), None);
+            let row_height = self.ivars().row_height.get();
+            let row = (point.y >= 0.0 && row_height > 0.0).then(|| (point.y / row_height) as usize);
+            context_menu::menu_for_click(self, row)
+        }
+
+        #[unsafe(method_id(validRequestorForSendType:returnType:))]
+        fn valid_requestor(
+            &self,
+            send: Option<&NSString>,
+            give_back: Option<&NSString>,
+        ) -> Option<Retained<AnyObject>> {
+            if context_menu::serves(send, give_back) {
+                Some(self.retain().into())
+            } else {
+                // SAFETY: NSResponder implements this method with this signature.
+                unsafe {
+                    msg_send![super(self), validRequestorForSendType: send, returnType: give_back]
+                }
+            }
+        }
+
+        #[unsafe(method(writeSelectionToPasteboard:types:))]
+        fn write_selection(&self, pasteboard: &NSPasteboard, _types: &NSArray<NSString>) -> bool {
+            context_menu::write_selection(pasteboard)
         }
 
         #[unsafe(method(resizeWithOldSuperviewSize:))]

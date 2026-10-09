@@ -48,6 +48,8 @@ This is the Ghostty model: a core library and a thin native shell. The shell con
 | `format` | Size and date text. |
 | `pane` | Navigation state: directory, entries, cursor, history, cursor memory, filter. |
 | `viewport` | Scroll arithmetic with the vim rules: half page, page, top, bottom, and the 2-row margin of line moves. Pure functions. |
+| `names` | New names for copies, aliases, and archives, like Finder: `report copy.pdf`, `file 2.txt`, `report.pdf alias`, `report.pdf.zip`. Pure functions. |
+| `transfer` | The rules of a copy, move, or alias into a folder: the name style, the "inside itself" test, and the status text. Pure functions. |
 
 The public API of `bf-core` is the contract with `bf-app`. The doc comments in the source are the specification.
 
@@ -58,7 +60,7 @@ The public API of `bf-core` is the contract with `bf-app`. The doc comments in t
 | `main` | CLI arguments. The `+` commands. Starts `NSApplication`. |
 | `app` | The app delegate, the main menu, the app state, the dispatch of actions. |
 | `window` | The `NSWindow`, the split view (sidebar and content), the column header, the list, the prompt, the path and status bar, and the help overlay. |
-| `list_view` | A custom `NSView` in an `NSScrollView`. It draws only the dirty rows. It handles keys and the mouse. It is the controller of the Quick Look panel. During a smooth scroll, a small subview shows the moving cursor highlight. |
+| `list_view` | A custom `NSView` in an `NSScrollView`. It draws only the dirty rows. It handles keys and the mouse, and gives the context menu (`menuForEvent:`). It is the controller of the Quick Look panel. During a smooth scroll, a small subview shows the moving cursor highlight. |
 | `columns` | The text of the list columns: size, Kind, and dates. It follows the locale, like Finder. |
 | `header` | The column header above the list. A click on a title sorts the list. |
 | `sidebar` | The sidebar (`NSOutlineView`, source list style) with Favorites and Locations. A background thread builds the model. A volume row has an eject button. |
@@ -69,7 +71,8 @@ The public API of `bf-core` is the contract with `bf-app`. The doc comments in t
 | `goto_panel` | The Go to Folder panel with up to 8 matching folders. `Tab` completes the path. The same view without a field is the match list of the location field. |
 | `help` | The key binding help overlay. It takes the keyboard focus. The movement keys of the keymap scroll it. `cancel`, `help`, and `q` close it. |
 | `smooth` | The smooth scroll driver for the list and the help overlay. A display link moves the clip view and the cursor highlight with an ease-out curve. |
-| `file_ops` | File system helpers with data-safety rules, for example a rename that never replaces an item. |
+| `file_ops` | File system helpers with data-safety rules, for example a rename that never replaces an item. `transfer` copies, moves, or makes aliases of items in a folder on a background thread, and `compress` runs `ditto`. They never replace an item. |
+| `context_menu` | The context menu of the list (a right click or a control click), the Open With and Share parts of the actions, and the Services of the list. |
 | `quicklook` | `QLPreviewPanel` data source and delegate. |
 | `editor` | Opens a text file in the `editor` command, in a new window of Ghostty or Terminal. It runs `osascript`. The effect is `OpenFile`; a background thread checks for text. |
 | `icons` | File icons from `NSWorkspace`, with a cache. Each icon renders one time into a bitmap at the draw size. |
@@ -144,7 +147,7 @@ When the help overlay is open, it has the keyboard focus. `app::help_key` sends 
 
 ## Roadmap
 
-- Multi-select and marks, copy, cut, and paste of files.
+- Multi-select and marks, and cut and paste (a move) of files. Copy and paste of one item works.
 - Drag and drop to and from other apps.
 - Tabs and split panes.
 - A preview column (Miller columns), like Finder column view.

@@ -73,6 +73,9 @@ pub enum Step {
     Width(f64, Option<f64>),
     /// `@eject:<name>`: click the eject button of the sidebar row `name`.
     ClickEject(String),
+    /// `@menu:<row>` or `@menu:bg`: build the context menu of a row (the
+    /// cursor moves to it) or of the folder, and print its items to stdout.
+    Menu(Option<usize>),
 }
 
 /// A scripted run: keys to feed, then an optional screenshot.
@@ -101,6 +104,17 @@ pub fn parse_keys(text: &str) -> Result<Vec<Step>, String> {
     for token in text.split_whitespace() {
         if let Some(name) = token.strip_prefix("@eject:") {
             steps.push(Step::ClickEject(name.to_string()));
+            continue;
+        }
+        if let Some(target) = token.strip_prefix("@menu:") {
+            let row = match target {
+                "bg" => None,
+                row => Some(
+                    row.parse()
+                        .map_err(|_| format!("--debug-keys: {token}: use a row number or bg"))?,
+                ),
+            };
+            steps.push(Step::Menu(row));
             continue;
         }
         if token == "@load" {
@@ -311,6 +325,11 @@ fn step() {
             if !crate::sidebar::click_eject_button(&name) {
                 eprintln!("better-finder: --debug-keys: no eject button for {name}");
             }
+            schedule_step();
+            return;
+        }
+        Some(Step::Menu(row)) => {
+            crate::context_menu::debug_print(row);
             schedule_step();
             return;
         }
