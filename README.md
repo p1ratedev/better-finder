@@ -25,14 +25,16 @@ Finder is good with a mouse. It is slow with a keyboard. Better Finder keeps the
 ## Highlights
 
 - ⚡ **Fast.** The window shows in about 150 ms. A folder with 10 000 files loads in about 30 ms, on a background thread. The app uses about 40 to 60 MB of memory.
-- ⌨️ **Keyboard first.** vim keys and Finder keys work together. Key sequences such as `gd` (go to Downloads) work. You can bind any key to any of the 35 actions.
+- ⌨️ **Keyboard first.** vim keys and Finder keys work together. Key sequences such as `gd` (go to Downloads) work. You can bind any key to any of the 42 actions.
 - 🧈 **Smooth scroll, like nvim.** `ctrl+d` and `ctrl+u` move the view and the cursor together, with a short animation. `j` and `k` stay instant.
 - 📝 **One dotfile.** `~/.config/better-finder/config` uses the Ghostty syntax. The app reloads it when you save it.
 - 👀 **Native Quick Look.** Press `Space` to preview a file, like in Finder.
+- 🖱️ **Drag and drop.** Drag a file to Telegram, Mail, or Finder. Drop files on a folder row, on an app, or on the list. The Finder rules apply: a move on the same volume, `option` for a copy, `control` for an alias.
 - 🪟 **The Finder look.** A glass sidebar with Favorites and Locations, a toolbar, a column header that sorts, the Kind column, sizes and dates in your locale, and a path bar.
 - 💽 **Disks.** Disks, disk images, and network shares show in the sidebar when they mount. `cmd+e` ejects them.
+- 🖱️ **The Finder context menu.** A right click shows the Finder items: Open With, Duplicate, Make Alias, Compress, Copy and Paste of files, Get Info, Share, and the Services.
 - ✍️ **Your editor.** `Enter` on a text file opens it in nvim (or another editor) in a new Ghostty or Terminal window.
-- 🛡️ **Safe file operations.** A rename never replaces a file. A delete moves the file to the Trash. Destructive keys do not repeat when you hold them.
+- 🛡️ **Safe file operations.** A rename, a paste, or a duplicate never replaces a file. A delete moves the file to the Trash. Destructive keys do not repeat when you hold them.
 
 ## Install
 
@@ -72,7 +74,9 @@ cargo run --release -p bf-app -- ~/Downloads
 | `.` | Show or hide hidden files |
 | `r` | Rename in the list |
 | `cmd+Backspace` | Move to the Trash |
+| `cmd+c` `cmd+v` | Copy a file, and paste it here or in another app |
 | `cmd+e` | Eject a disk |
+| Right click | The Finder context menu |
 | `?` | Show all keys |
 
 All keys are in [Default keys](#default-keys).
@@ -177,6 +181,11 @@ better-finder +validate-config         # check the config file for errors
 | `r` | Rename |
 | `cmd+shift+n` | New folder |
 | `cmd+Backspace` | Move to the Trash |
+| `cmd+c` | Copy the file under the cursor. A paste in Finder, Mail, or a chat app gets the file |
+| `cmd+v` | Paste the copied files into this folder. A name that exists gets a new name (`file 2.txt`): a paste never replaces a file |
+| `cmd+d` | Duplicate (`report copy.pdf`) |
+| `cmd+ctrl+a` | Make a Finder alias (`report.pdf alias`) |
+| `cmd+i` | Get Info: the Finder Info window |
 | `cmd+e` | Eject a disk. When the disk is in use, press `cmd+e` again within 5 s to force the eject |
 | `cc` `cn` | Copy the path or the name |
 | `T` | Open a terminal here |
@@ -199,7 +208,7 @@ The numbers come from one Apple Silicon Mac, with `BETTER_FINDER_TRACE=1` and `f
 
 Better Finder follows the Ghostty model: a core library and a thin native shell.
 
-- **`bf-core`** is pure Rust, with no UI code: the config parser, the keymap, the directory listing, sort, filter, navigation state, and the scroll math. 146 unit tests cover it.
+- **`bf-core`** is pure Rust, with no UI code: the config parser, the keymap, the directory listing, sort, filter, navigation state, the scroll math, the names of new files, and the drop rules. 173 unit tests cover it.
 - **`bf-app`** is the native macOS app, written with AppKit through [`objc2`](https://github.com/madsmtm/objc2):
   - A custom list view draws only the visible rows, so a frame costs the same for 50 files or 100 000.
   - `Space` opens the real `QLPreviewPanel`.
@@ -210,8 +219,8 @@ The design contracts are in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [
 
 ## Roadmap
 
-- [ ] Multi-select, and copy, cut, and paste of files
-- [ ] Drag and drop to and from other apps
+- [ ] Multi-select, and cut and paste (a move) of files
+- [x] Drag and drop to and from other apps
 - [ ] Tabs and split panes
 - [ ] A column view (Miller columns) with a preview column
 - [ ] Date groups (Today, Yesterday, Previous 7 Days) and a Date Added column

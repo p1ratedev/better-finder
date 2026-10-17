@@ -143,6 +143,7 @@ The help overlay (`help`, `?`) takes the keyboard focus while it is open.
 
 - Key events go through the user keymap. In the overlay, the movement actions scroll the overlay: `cursor_down` and `cursor_up` (one line), `half_page_down` and `half_page_up`, `page_down` and `page_up`, `cursor_top` and `cursor_bottom`. Scrolling uses the smooth scroll rules below.
 - `cancel`, `help`, and the key `q` close the overlay. `quit` still quits. The overlay ignores all other actions.
+- When the overlay closes, the keyboard focus goes back to the view that had it before: the list or the sidebar. The app reads the focus before it hides the overlay, because AppKit gives the focus of a hidden view to the window.
 - The mouse wheel also scrolls the overlay.
 - SHOULD: `/` in the overlay focuses a small filter field at the top. The filter matches the keys, the action names, and the descriptions.
 
@@ -168,6 +169,40 @@ Animation:
 - Config: `smooth-scroll = true`, `smooth-scroll-duration = 150` (milliseconds, 0 to 1000; 0 turns the animation off).
 
 The scroll arithmetic is a pure function in bf-core (for example a `viewport` module), with unit tests for the edges: the first and last rows, short lists, and a list shorter than the view.
+
+## Drag and drop
+
+### Drag out of the list
+
+- A drag of a row starts when the mouse moves 4 pt or more from a single click. A double click does not start a drag.
+- The drag item is the file URL of the entry. The drag pasteboard gets `public.file-url`, `NSFilenamesPboardType`, and the URL types, like a drag from Finder. So Finder, Telegram, Mail, and browsers accept the drop.
+- The drag picture is the icon and the name of the row in the normal colors. Without a picture, the drag shows the file icon.
+- The list offers copy, move, link, and generic. The app that gets the drop chooses one: Finder moves the file on the same volume and copies it to another volume, and the option key forces a copy.
+
+### Drop on the list
+
+The list takes drops of files (`public.file-url`) from Finder, from other apps, and from the list itself.
+
+| Drop place | What the drop does | Ring |
+| --- | --- | --- |
+| A folder row | Puts the files in that folder | Around the row |
+| An app row (`.app`) | Opens the files with that app | Around the row |
+| A file row, a package row, or the empty space | Puts the files in the current folder | Around the list |
+
+The mode follows Finder (`bf_core::drop::choose`):
+
+- No modifier key: a move on the same volume, a copy to another volume.
+- Option: a copy. Control: an alias. Command: a move.
+- A move to another volume copies the files and keeps the sources. The app never deletes a source after a copy.
+
+The drop does nothing (`bf_core::drop::check`) when:
+
+- it is a move into the folder that has the files already (for example a row on its own folder), or
+- it copies or moves a folder into itself or into one of its subfolders. A drop on the row of a dragged folder then goes to the current folder.
+
+The file work never replaces a file. A name conflict gives the Finder "Keep Both" name (`file 2.txt`). A copy into the same folder gives the duplicate name (`file copy.txt`). The work runs on a background thread, then the list reloads and the status bar shows the result.
+
+Later: drops on the sidebar, spring-loaded folders (a folder opens during a drag), and a scroll of the list at its edges during a drag.
 
 ## Volumes and eject
 
@@ -213,6 +248,11 @@ The scroll arithmetic is a pure function in bf-core (for example a `viewport` mo
 | `cmd+shift+a` | `goto:/Applications` | Finder |
 | `cmd+shift+u` | `goto:/Applications/Utilities` | Finder |
 | `cmd+shift+i` | `goto:~/Library/Mobile Documents/com~apple~CloudDocs` | Finder |
+| `cmd+c` | `copy` | Finder. Only when the list has the focus |
+| `cmd+v` | `paste` | Finder. Only when the list has the focus |
+| `cmd+d` | `duplicate` | Finder |
+| `cmd+ctrl+a` | `make_alias` | Finder |
+| `cmd+i` | `get_info` | Finder |
 
 ## bf-core changes for this design
 
@@ -224,9 +264,113 @@ The scroll arithmetic is a pure function in bf-core (for example a `viewport` mo
 - Actions: `toggle_sidebar`, `focus_sidebar`. The default keys in the table above.
 - The config template documents all the new keys.
 
+## Context menu
+
+A right click or a control click on the list shows a context menu with the Finder items and order of macOS 15 (module `context_menu`).
+
+- A click on a row moves the cursor to the row, like a single click, and the list gets the keyboard focus. Then the menu of that entry shows.
+- A click below the last row shows the menu of the current folder. The cursor does not move.
+- The app has one cursor and no multi-selection. The items of the row menu act on the entry under the cursor.
+- An automatic refresh can change the rows while the menu is open. An item acts only when its entry or its folder is still in the list. If not, the status bar shows an error.
+- A name in an item title is in curly quotes and is truncated in the middle to 40 characters.
+- The menu sets `enabled` itself (`autoenablesItems` is off). One target object gets all clicks. The action runs after the menu closes.
+
+### Row menu
+
+| Item | Action | Note |
+| --- | --- | --- |
+| Open | `open` | |
+| Open With > | | Files and packages, not plain folders. See below. |
+| Show Package Contents | `goto:<path>` | Packages only |
+| --- | | |
+| Move to Trash | `trash` | |
+| --- | | |
+| Get Info | `get_info` | |
+| Rename | `rename` | |
+| Compress “name” | `compress` | |
+| Duplicate | `duplicate` | |
+| Make Alias | `make_alias` | |
+| Quick Look “name” | `quick_look` | |
+| --- | | |
+| Copy “name” | `copy` | |
+| Copy as Pathname | `copy_path` | |
+| Share… | `share` | |
+| --- | | |
+| Show in Finder | `reveal_in_finder` | |
+| Services > | | AppKit adds it at the end (see "Services" below). |
+
+Open With:
+
+- The default app first, as `<App> (default)`, then a separator.
+- The other apps from `NSWorkspace URLsForApplicationsToOpenURL:`, sorted by display name (without `.app`), each with its 16 x 16 icon, then a separator.
+- `Other…` shows an `NSOpenPanel` sheet at `/Applications` that accepts only apps. The chosen app opens the file.
+- The file opens with `NSWorkspace openURLs:withApplicationAtURL:configuration:completionHandler:`. An error shows in the status bar.
+- The app list and the icons take 10 to 30 ms. So the submenu fills when it opens (`menuNeedsUpdate:`), like Finder, and the context menu shows at once.
+
+### Folder menu
+
+| Item | Action | Note |
+| --- | --- | --- |
+| New Folder | `new_folder` | |
+| --- | | |
+| Get Info | `get_info` | Of the current folder |
+| --- | | |
+| Paste Item, Paste N Items | `paste` | Disabled when the general pasteboard has no file URLs |
+| --- | | |
+| Sort By > | `sort:<key>` | Name, Size, Date Modified, Date Created, Extension, a separator, and Reverse Order (`toggle_sort_reverse`). A checkmark shows the current key and the reverse order. |
+| Show Hidden Files | `toggle_hidden` | A checkmark when hidden files show |
+| --- | | |
+| Copy as Pathname | `copy_path` | Of the current folder |
+| Open in Terminal | `open_terminal` | |
+| Show in Finder | `reveal_in_finder` | Of the current folder |
+
+The folder menu uses `app::dispatch_on(action, cwd)`: `get_info`, `copy_path`, and `reveal_in_finder` act on the current folder, not on the entry under the cursor.
+
+### File actions
+
+Data safety comes first. These actions never replace an item and never delete an item. The disk work runs on a background thread. Then the list reads the folder again, the cursor goes to the new item when the list shows it, and the status bar shows one message.
+
+- `copy` (`cmd+c`): puts the entry under the cursor on the general pasteboard as a file URL (`writeObjects:` with an `NSURL`). A paste in Finder, Mail, or a chat app gets the file. Message: `Copied "report.pdf"`.
+- `paste` (`cmd+v`): copies the file URLs of the general pasteboard into the current folder. It never moves them.
+  - A file from the current folder gets the duplicate name: `report copy.pdf`.
+  - A name that exists gets the Finder "Keep Both" name: `file 2.txt`, `file 3.txt`.
+  - A folder does not go into itself or into one of its subfolders. The status bar shows an error.
+- `duplicate` (`cmd+d`): a copy in the same folder.
+  - `report copy.pdf`, then `report copy 2.pdf`. A duplicate of `report copy.pdf` is `report copy 2.pdf`, like Finder.
+  - Folders: `Folder copy`, `Folder copy 2`.
+  - A package keeps its extension at the end: `Safari copy.app`.
+  - A name that starts with a dot and has no other dot has no extension: `.zshrc copy`.
+- `make_alias` (`cmd+ctrl+a`): a real Finder alias file (`NSURL bookmarkDataWithOptions:` with `NSURLBookmarkCreationSuitableForBookmarkFile`, then `writeBookmarkData:toURL:options:error:`): `report.pdf alias`, then `report.pdf alias 2`.
+- `compress`: `/usr/bin/ditto -c -k --sequesterRsrc` on a background thread. A folder also gets `--keepParent`, so the archive holds the folder. A file does not: else the archive also holds the name of its folder. The name is `report.pdf.zip`, then `report.pdf 2.zip`. No default key.
+- `get_info` (`cmd+i`): opens the Finder Info window through `osascript` on a background thread. The path goes to the script as an argument, never in the script text. Without an entry under the cursor, it shows the info of the current folder. The first time, macOS asks the user to allow Better Finder to control Finder. When macOS refuses, the status bar says: allow it in System Settings > Privacy & Security > Automation.
+- `share`: shows the macOS share menu (`NSSharingServicePicker`) next to the cursor row. No default key.
+
+How the copies work:
+
+- A copy uses `NSFileManager copyItemAtURL:toURL:error:`. It clones the file on APFS, keeps the metadata, copies a folder with its content, and copies a symlink as a link. It fails when the target exists.
+- The name comes from a loop: the first name that does not exist, with an operation that fails when the name exists. A new alias or archive first makes an empty file with `O_EXCL`, so the name is ours before the work starts.
+- The name rules are pure functions in `bf_core::names`. The transfer rules are in `bf_core::transfer`.
+- `file_ops::transfer(sources, dest_dir, mode)` does the work of `paste` (`Copy`), `duplicate` (`Copy`), and `make_alias` (`Alias`). The mode `Move` renames an item on the same volume only. On another volume it copies, and the source stays. A move into the folder of the source does nothing. Drag and drop can use the same function.
+
+### Keys and text fields
+
+The keymap gets no keys while a prompt is open, and `ListView` acts on a key equivalent only when the list is the first responder. So in the filter, rename, and go-to fields, `cmd+c` and `cmd+v` copy and paste text as before: the Edit menu items (`copy:`, `paste:`) handle them.
+
+### Services
+
+- The list is a Services requestor. `validRequestorForSendType:returnType:` accepts a file URL (`public.file-url`) or a string, with no return type, when an entry is under the cursor. `writeSelectionToPasteboard:types:` writes the file URL and the path.
+- The app registers these send types at launch (`registerServicesMenuSendTypes:returnTypes:`).
+- AppKit then adds a Services submenu at the end of the row menu by itself.
+- The folder menu has no Services: the Services of the list act on the entry under the cursor, not on the folder.
+
+### Test without a mouse
+
+`--debug-keys "@menu:3 @menu:bg"` builds the menu of row 3 (the cursor moves to it) and the menu of the folder, and prints the items to stdout: submenus are indented, `[x]` is a checkmark, `(disabled)` is a disabled item, and `---` is a separator.
+
 ## Later (not in this round)
 
 - Groups by date (`Today`, `Yesterday`, `Previous 7 Days`), like the Finder `Use Groups` option.
 - A `Date Added` column. It needs `getattrlistbulk` (`ATTR_CMNEXT_ADDEDTIME`) in `bf_core::fs::read_dir`.
 - Image thumbnails as icons (QuickLookThumbnailing, on a background queue, with a cache).
 - Tags in the sidebar.
+- Tags in the context menu (the color dots and Tags…).

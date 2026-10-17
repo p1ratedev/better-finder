@@ -6,6 +6,7 @@
 
 mod app;
 mod columns;
+mod context_menu;
 mod debug;
 mod editor;
 mod file_ops;
@@ -52,7 +53,9 @@ Developer options:
   --debug-keys \"<t1> <t2> ...\"       Feed key triggers (keymap syntax) before the screenshot.
                                      @<ms> waits, @load waits for a load,
                                      @w<w>x<h> sets the window size, @eject:<name>
-                                     clicks the eject button of a sidebar row. Prefixes:
+                                     clicks the eject button of a sidebar row,
+                                     @menu:<row> and @menu:bg print the context menu
+                                     of a row or of the folder. Prefixes:
                                      ~ key repeat, ! keymap also with the prompt open,
                                      ^ same turn as the previous key (no wait for a load)
   --debug-appearance light|dark      Force the appearance (for the system and auto themes)

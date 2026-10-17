@@ -59,6 +59,24 @@ pub enum Action {
     Trash,
     CopyPath,
     CopyName,
+    /// Put the entry under the cursor on the pasteboard as a file, so that
+    /// a paste in Finder or in another app gets the file.
+    Copy,
+    /// Copy the files on the pasteboard into the current directory. It
+    /// never replaces an item.
+    Paste,
+    /// Copy the entry under the cursor in its directory: `report copy.pdf`.
+    Duplicate,
+    /// Make a Finder alias file of the entry under the cursor:
+    /// `report.pdf alias`.
+    MakeAlias,
+    /// Make a zip archive of the entry under the cursor: `report.pdf.zip`.
+    Compress,
+    /// Show the Finder Info window of the entry under the cursor, or of the
+    /// current directory.
+    GetInfo,
+    /// Show the macOS share menu for the entry under the cursor.
+    Share,
     /// Open the configured terminal app in the current directory.
     OpenTerminal,
     RevealInFinder,
@@ -159,6 +177,13 @@ impl FromStr for Action {
             "trash" => Self::Trash,
             "copy_path" => Self::CopyPath,
             "copy_name" => Self::CopyName,
+            "copy" => Self::Copy,
+            "paste" => Self::Paste,
+            "duplicate" => Self::Duplicate,
+            "make_alias" => Self::MakeAlias,
+            "compress" => Self::Compress,
+            "get_info" => Self::GetInfo,
+            "share" => Self::Share,
             "open_terminal" => Self::OpenTerminal,
             "reveal_in_finder" => Self::RevealInFinder,
             "eject" => Self::Eject,
@@ -207,6 +232,13 @@ impl fmt::Display for Action {
             Self::Trash => "trash",
             Self::CopyPath => "copy_path",
             Self::CopyName => "copy_name",
+            Self::Copy => "copy",
+            Self::Paste => "paste",
+            Self::Duplicate => "duplicate",
+            Self::MakeAlias => "make_alias",
+            Self::Compress => "compress",
+            Self::GetInfo => "get_info",
+            Self::Share => "share",
             Self::OpenTerminal => "open_terminal",
             Self::RevealInFinder => "reveal_in_finder",
             Self::Eject => "eject",
@@ -265,6 +297,22 @@ static CATALOG: &[(&str, &str)] = &[
     ),
     ("copy_name", "Copy the name of the entry to the clipboard."),
     (
+        "copy",
+        "Copy the entry as a file, for a paste here or in another app.",
+    ),
+    (
+        "paste",
+        "Paste the copied files into this folder. It never replaces a file.",
+    ),
+    ("duplicate", "Make a copy of the entry in its folder."),
+    ("make_alias", "Make a Finder alias of the entry."),
+    ("compress", "Make a zip archive of the entry."),
+    (
+        "get_info",
+        "Show the Finder Info window of the entry or the folder.",
+    ),
+    ("share", "Show the share menu for the entry."),
+    (
         "open_terminal",
         "Open the terminal app in the current directory.",
     ),
@@ -303,7 +351,7 @@ mod tests {
             assert_eq!(a.to_string().parse::<Action>().unwrap(), a);
             assert!(!a.description().is_empty(), "{a}");
         }
-        assert_eq!(all_actions().len(), 36);
+        assert_eq!(all_actions().len(), 43);
     }
 
     #[test]
@@ -321,6 +369,24 @@ mod tests {
         assert!("quit:now".parse::<Action>().is_err());
         assert!("bogus".parse::<Action>().is_err());
         assert!("".parse::<Action>().is_err());
+    }
+
+    #[test]
+    fn file_actions() {
+        for (text, action) in [
+            ("copy", Action::Copy),
+            ("paste", Action::Paste),
+            ("duplicate", Action::Duplicate),
+            ("make_alias", Action::MakeAlias),
+            ("compress", Action::Compress),
+            ("get_info", Action::GetInfo),
+            ("share", Action::Share),
+        ] {
+            assert_eq!(text.parse(), Ok(action.clone()));
+            assert_eq!(action.to_string(), text);
+            assert!(!action.description().is_empty(), "{text}");
+        }
+        assert!("paste:here".parse::<Action>().is_err());
     }
 
     #[test]

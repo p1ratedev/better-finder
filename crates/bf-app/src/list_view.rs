@@ -5,7 +5,13 @@
 //!   the toolbar and the column header: `inset_top` is the height that they
 //!   cover, and the scroll code keeps the cursor below it.
 //! - It converts key events to `bf_core::KeyEvent` and sends them to the keymap.
-//! - It handles the mouse.
+//! - It handles the mouse. A drag of a row gives its file URL to other apps
+//!   (Finder, Telegram, Mail), like a drag from Finder. A right click or a
+//!   control click shows the context menu (`context_menu`).
+//! - It gives the entry under the cursor to the macOS Services.
+//! - It takes drops of files: on a folder row (into the folder), on an app
+//!   row (open with the app), or on the other rows and the empty space
+//!   (into the current folder). `bf_core::drop` has the Finder rules.
 //! - It is the controller of the Quick Look panel (it is in the responder chain).
 //! - It hosts the inline rename field.
 //! - During a smooth scroll, a small subview (`HighlightView`) shows the
@@ -15,23 +21,35 @@
 //!   text under the moving highlight stays readable, and a frame redraws
 //!   only the subview and the rows that the scroll shows.
 
-use std::cell::{Cell, OnceCell};
+use std::cell::{Cell, OnceCell, RefCell};
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
+use bf_core::drop::{self, Offered};
 use bf_core::keymap::{Key, Mods, NamedKey};
+use bf_core::transfer::TransferMode;
 use bf_core::viewport::Viewport;
 use bf_core::{Entry, KeyEvent};
 use objc2::rc::Retained;
-use objc2::{ClassType, DefinedClass, MainThreadOnly, define_class, msg_send};
+use objc2::runtime::{AnyObject, ProtocolObject};
+use objc2::{AnyThread, ClassType, DefinedClass, MainThreadOnly, Message, define_class, msg_send};
 use objc2_app_kit::{
-    NSBezierPath, NSEvent, NSEventModifierFlags, NSResponder, NSStringDrawing, NSView,
+    NSBezierPath, NSColor, NSDragOperation, NSDraggingContext, NSDraggingDestination,
+    NSDraggingInfo, NSDraggingItem, NSDraggingSession, NSDraggingSource, NSEvent,
+    NSEventModifierFlags, NSImage, NSMenu, NSPasteboard, NSPasteboardTypeFileURL, NSResponder,
+    NSStringDrawing, NSView, NSWorkspace,
 };
-use objc2_foundation::{MainThreadMarker, NSObject, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{
+    MainThreadMarker, NSArray, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSURL,
+};
 use objc2_quick_look_ui::QLPreviewPanel;
 
 use crate::app::{self, AppState};
 use crate::columns;
+use crate::context_menu;
 use crate::debug::trace;
+use crate::file_ops;
 use crate::icons;
 use crate::quicklook;
 use crate::smooth;
@@ -59,11 +77,48 @@ pub struct ListIvars {
     rows: Cell<usize>,
     /// The height at the top that the toolbar and the column header cover.
     inset_top: Cell<f64>,
+    /// The window point and the row of the last single click. A drag of
+    /// the mouse from this point starts a drag of the row.
+    drag_start: Cell<Option<(NSPoint, usize)>>,
+    /// Where a drop goes now, during a drag over the list. The list draws
+    /// a ring there.
+    drop_place: Cell<Option<DropPlace>>,
+    /// The files of the current drag over the list: the drag sequence
+    /// number and the resolved paths. A drag reads its pasteboard once.
+    drop_files: RefCell<Option<(isize, Vec<PathBuf>)>>,
+}
+
+/// Where a drop goes in the list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DropPlace {
+    /// The folder or the app on this row.
+    Row(usize),
+    /// The current folder: the whole list.
+    List,
+}
+
+/// What a drop at the drag location does.
+struct DropPlan {
+    place: DropPlace,
+    target: DropTarget,
+}
+
+enum DropTarget {
+    /// Copy, move, or make aliases in this folder (a resolved path).
+    Folder(PathBuf, TransferMode),
+    /// Open the files with this app.
+    App(PathBuf),
 }
 
 thread_local! {
     static FIRST_FRAME: Cell<bool> = const { Cell::new(false) };
+    /// True while the list draws the picture of a drag: all rows draw in
+    /// the normal colors.
+    static DRAG_PICTURE: Cell<bool> = const { Cell::new(false) };
 }
+
+/// The distance in points that the mouse moves before a drag starts.
+const DRAG_THRESHOLD: f64 = 4.0;
 
 define_class!(
     // SAFETY:
@@ -123,10 +178,28 @@ define_class!(
             if let Some(window) = self.window() {
                 window.makeFirstResponder(Some(self.as_responder()));
             }
+            self.ivars().drag_start.set(None);
             let row_height = self.ivars().row_height.get();
             if point.y >= 0.0 && row_height > 0.0 {
-                app::click_row((point.y / row_height) as usize, event.clickCount() >= 2);
+                let row = (point.y / row_height) as usize;
+                let double = event.clickCount() >= 2;
+                if !double {
+                    self.ivars()
+                        .drag_start
+                        .set(Some((event.locationInWindow(), row)));
+                }
+                app::click_row(row, double);
             }
+        }
+
+        #[unsafe(method(mouseDragged:))]
+        fn mouse_dragged(&self, event: &NSEvent) {
+            self.drag_if_moved(event);
+        }
+
+        #[unsafe(method(mouseUp:))]
+        fn mouse_up(&self, _event: &NSEvent) {
+            self.ivars().drag_start.set(None);
         }
 
         #[unsafe(method(scrollWheel:))]
@@ -137,6 +210,35 @@ define_class!(
             app::after_now(app::cancel_inline_rename);
             // SAFETY: NSResponder implements this method with this signature.
             let _: () = unsafe { msg_send![super(self), scrollWheel: event] };
+        }
+
+        #[unsafe(method_id(menuForEvent:))]
+        fn menu_for_event(&self, event: &NSEvent) -> Option<Retained<NSMenu>> {
+            let point = self.convertPoint_fromView(event.locationInWindow(), None);
+            let row_height = self.ivars().row_height.get();
+            let row = (point.y >= 0.0 && row_height > 0.0).then(|| (point.y / row_height) as usize);
+            context_menu::menu_for_click(self, row)
+        }
+
+        #[unsafe(method_id(validRequestorForSendType:returnType:))]
+        fn valid_requestor(
+            &self,
+            send: Option<&NSString>,
+            give_back: Option<&NSString>,
+        ) -> Option<Retained<AnyObject>> {
+            if context_menu::serves(send, give_back) {
+                Some(self.retain().into())
+            } else {
+                // SAFETY: NSResponder implements this method with this signature.
+                unsafe {
+                    msg_send![super(self), validRequestorForSendType: send, returnType: give_back]
+                }
+            }
+        }
+
+        #[unsafe(method(writeSelectionToPasteboard:types:))]
+        fn write_selection(&self, pasteboard: &NSPasteboard, _types: &NSArray<NSString>) -> bool {
+            context_menu::write_selection(pasteboard)
         }
 
         #[unsafe(method(resizeWithOldSuperviewSize:))]
@@ -157,6 +259,47 @@ define_class!(
         #[unsafe(method(endPreviewPanelControl:))]
         fn end_preview_panel_control(&self, panel: Option<&QLPreviewPanel>) {
             quicklook::end_control(panel);
+        }
+    }
+
+    unsafe impl NSObjectProtocol for ListView {}
+
+    unsafe impl NSDraggingDestination for ListView {
+        #[unsafe(method(draggingEntered:))]
+        fn dragging_entered(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> NSDragOperation {
+            self.drop_update(sender)
+        }
+
+        #[unsafe(method(draggingUpdated:))]
+        fn dragging_updated(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> NSDragOperation {
+            self.drop_update(sender)
+        }
+
+        #[unsafe(method(draggingExited:))]
+        fn dragging_exited(&self, _sender: Option<&ProtocolObject<dyn NSDraggingInfo>>) {
+            self.set_drop_place(None);
+        }
+
+        #[unsafe(method(performDragOperation:))]
+        fn perform_drag_operation(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> bool {
+            self.drop_perform(sender)
+        }
+
+        #[unsafe(method(draggingEnded:))]
+        fn dragging_ended(&self, _sender: &ProtocolObject<dyn NSDraggingInfo>) {
+            self.set_drop_place(None);
+            self.ivars().drop_files.replace(None);
+        }
+    }
+
+    unsafe impl NSDraggingSource for ListView {
+        #[unsafe(method(draggingSession:sourceOperationMaskForDraggingContext:))]
+        fn source_operation_mask(
+            &self,
+            _session: &NSDraggingSession,
+            context: NSDraggingContext,
+        ) -> NSDragOperation {
+            drag_operations(context)
         }
     }
 );
@@ -217,9 +360,16 @@ impl ListView {
             row_height: Cell::new(20.0),
             rows: Cell::new(0),
             inset_top: Cell::new(0.0),
+            drag_start: Cell::new(None),
+            drop_place: Cell::new(None),
+            drop_files: RefCell::new(None),
         });
         // SAFETY: `initWithFrame:` is the designated initializer of NSView.
-        unsafe { msg_send![super(this), initWithFrame: frame] }
+        let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
+        // SAFETY: `NSPasteboardTypeFileURL` is an immutable static from AppKit.
+        let file_url = unsafe { NSPasteboardTypeFileURL };
+        this.registerForDraggedTypes(&NSArray::from_slice(&[file_url]));
+        this
     }
 
     fn as_responder(&self) -> &NSResponder {
@@ -454,11 +604,16 @@ impl ListView {
             free,
             dirty,
             active: self.is_active(),
-            animating: smooth::list_highlight().is_some(),
+            // The picture of a drag shows the rows in the normal colors,
+            // like a smooth scroll.
+            animating: smooth::list_highlight().is_some() || DRAG_PICTURE.get(),
             scale: self.window().map_or(2.0, |w| w.backingScaleFactor()),
             needs: &needs,
         };
         let drawn = app::with_ref(|s| draw_list(s, &input)).flatten();
+        if let Some(place) = self.ivars().drop_place.get() {
+            draw_drop_ring(self.drop_rect(place));
+        }
         smooth::note_draw(started.elapsed());
         let Some(rows) = drawn else { return };
         // The draw put paths in the icon queue. Get their icons after the frame.
@@ -471,6 +626,279 @@ impl ListView {
             );
         }
     }
+}
+
+impl ListView {
+    /// Starts a drag of the clicked row when the mouse moved far enough
+    /// from the click. The drag item is the file URL of the entry.
+    fn drag_if_moved(&self, event: &NSEvent) {
+        let Some((start, row)) = self.ivars().drag_start.get() else {
+            return;
+        };
+        let now = event.locationInWindow();
+        if (now.x - start.x).hypot(now.y - start.y) < DRAG_THRESHOLD {
+            return;
+        }
+        self.ivars().drag_start.set(None);
+        let width = self.bounds().size.width;
+        // The click put the cursor on the row. A reload can change the
+        // rows before the drag: then the drag does not start.
+        let info = app::with_ref(|s| {
+            let entry = s
+                .pane
+                .visible_entry(row)
+                .filter(|_| s.pane.cursor() == row)?;
+            Some((entry.path.clone(), s.style.layout(width).name_end))
+        })
+        .flatten();
+        let Some((path, name_end)) = info else {
+            return;
+        };
+        let Some(url) = NSURL::from_file_path(&path) else {
+            return;
+        };
+        let item = NSDraggingItem::initWithPasteboardWriter(
+            NSDraggingItem::alloc(),
+            ProtocolObject::from_ref(&*url),
+        );
+        let row_rect = self.row_rect(row);
+        let frame = NSRect::new(
+            NSPoint::new(LEFT_PAD - 4.0, row_rect.origin.y),
+            NSSize::new(
+                (name_end - LEFT_PAD + 4.0).max(row_rect.size.height),
+                row_rect.size.height,
+            ),
+        );
+        let (frame, image) = match self.drag_picture(frame) {
+            Some(image) => (frame, image),
+            None => {
+                // No picture of the row: the file icon at the icon place.
+                let size = row_rect.size.height;
+                let path = NSString::from_str(&path.to_string_lossy());
+                let icon = NSWorkspace::sharedWorkspace().iconForFile(&path);
+                (NSRect::new(frame.origin, NSSize::new(size, size)), icon)
+            }
+        };
+        let contents: &AnyObject = &image;
+        // SAFETY: The contents of a dragging item can be an `NSImage`.
+        unsafe { item.setDraggingFrame_contents(frame, Some(contents)) };
+        let items = NSArray::from_retained_slice(&[item]);
+        trace!("drag: {}", path.display());
+        self.beginDraggingSessionWithItems_event_source(
+            &items,
+            event,
+            ProtocolObject::from_ref(self),
+        );
+    }
+
+    /// A picture of the list in `rect` (the icon and the name of a row),
+    /// in the normal colors.
+    fn drag_picture(&self, rect: NSRect) -> Option<Retained<NSImage>> {
+        let rep = self.bitmapImageRepForCachingDisplayInRect(rect)?;
+        DRAG_PICTURE.set(true);
+        self.cacheDisplayInRect_toBitmapImageRep(rect, &rep);
+        DRAG_PICTURE.set(false);
+        let image = NSImage::initWithSize(NSImage::alloc(), rect.size);
+        image.addRepresentation(&rep);
+        Some(image)
+    }
+}
+
+impl ListView {
+    /// A drag moved over the list: find the drop place, show it, and
+    /// give the operation of a drop there.
+    fn drop_update(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> NSDragOperation {
+        let plan = self.drop_plan(sender);
+        self.set_drop_place(plan.as_ref().map(|p| p.place));
+        let mask = sender.draggingSourceOperationMask();
+        match plan.map(|p| p.target) {
+            Some(DropTarget::Folder(_, mode)) => drop_operation(mode),
+            Some(DropTarget::App(_)) => app_drop_operation(mask),
+            None => NSDragOperation::None,
+        }
+    }
+
+    /// The drop: start the copy, the move, or the open.
+    fn drop_perform(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> bool {
+        let plan = self.drop_plan(sender);
+        let files = self.dragged_files(sender);
+        self.set_drop_place(None);
+        let Some(plan) = plan else {
+            return false;
+        };
+        match plan.target {
+            DropTarget::Folder(dest, mode) => file_ops::transfer(files, dest, mode),
+            DropTarget::App(path) => context_menu::open_with(&files, &path),
+        }
+        true
+    }
+
+    /// What a drop at the drag location does, or `None` when a drop does
+    /// nothing there. A folder row takes the files. An app row opens them.
+    /// Other rows and the empty space give them to the current folder.
+    fn drop_plan(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> Option<DropPlan> {
+        let files = self.dragged_files(sender);
+        if files.is_empty() {
+            return None;
+        }
+        let offered = offered(sender.draggingSourceOperationMask());
+        let point = self.convertPoint_fromView(sender.draggingLocation(), None);
+        let h = self.ivars().row_height.get();
+        // The toolbar and the column header cover the top of the list.
+        let row = (point.y >= self.free_rect().origin.y && h > 0.0).then(|| (point.y / h) as usize);
+        let (on_row, cwd) = app::with_ref(|s| {
+            let on_row = row.and_then(|row| {
+                let e = s.pane.visible_entry(row)?;
+                let is_app = e.is_package && e.extension().eq_ignore_ascii_case("app");
+                Some((row, e.path.clone(), e.is_dir, is_app))
+            });
+            (on_row, s.pane.cwd().to_path_buf())
+        })?;
+        if let Some((row, path, is_dir, is_app)) = on_row {
+            let place = DropPlace::Row(row);
+            let resolved = std::fs::canonicalize(&path).ok();
+            let dragged = resolved.as_ref().is_some_and(|p| files.contains(p));
+            if is_app && !dragged {
+                let target = DropTarget::App(path);
+                return Some(DropPlan { place, target });
+            }
+            if let Some((dest, mode)) = is_dir
+                .then(|| folder_drop(&files, &path, offered))
+                .flatten()
+            {
+                let target = DropTarget::Folder(dest, mode);
+                return Some(DropPlan { place, target });
+            }
+        }
+        let (dest, mode) = folder_drop(&files, &cwd, offered)?;
+        let target = DropTarget::Folder(dest, mode);
+        Some(DropPlan {
+            place: DropPlace::List,
+            target,
+        })
+    }
+
+    /// The resolved paths of the files of the current drag.
+    fn dragged_files(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> Vec<PathBuf> {
+        let number = sender.draggingSequenceNumber();
+        let cache = &self.ivars().drop_files;
+        if let Some((n, files)) = &*cache.borrow() {
+            if *n == number {
+                return files.clone();
+            }
+        }
+        let files = file_paths(&sender.draggingPasteboard());
+        cache.replace(Some((number, files.clone())));
+        files
+    }
+
+    /// Shows the ring at `place`, or no ring.
+    fn set_drop_place(&self, place: Option<DropPlace>) {
+        let old = self.ivars().drop_place.replace(place);
+        if old != place {
+            for p in [old, place].into_iter().flatten() {
+                self.setNeedsDisplayInRect(self.drop_rect(p));
+            }
+        }
+    }
+
+    fn drop_rect(&self, place: DropPlace) -> NSRect {
+        match place {
+            DropPlace::Row(row) => self.row_rect(row),
+            DropPlace::List => self.free_rect(),
+        }
+    }
+}
+
+/// The operations that a drag from the list offers. The app that gets the
+/// drop chooses one, like for a drag from Finder: Finder moves the file on
+/// the same volume and copies it to another volume, and the option key
+/// forces a copy. The list itself is also a drop target (a move into a
+/// folder row).
+fn drag_operations(_context: NSDraggingContext) -> NSDragOperation {
+    NSDragOperation::Copy | NSDragOperation::Link | NSDragOperation::Generic | NSDragOperation::Move
+}
+
+/// The operations that a drag source offers, for `bf_core::drop`.
+fn offered(mask: NSDragOperation) -> Offered {
+    Offered {
+        copy: mask.contains(NSDragOperation::Copy),
+        link: mask.contains(NSDragOperation::Link),
+        generic: mask.contains(NSDragOperation::Generic),
+        moves: mask.contains(NSDragOperation::Move),
+    }
+}
+
+/// The drag operation that shows the drop mode (the badge at the pointer).
+fn drop_operation(mode: TransferMode) -> NSDragOperation {
+    match mode {
+        TransferMode::Copy => NSDragOperation::Copy,
+        TransferMode::Move => NSDragOperation::Move,
+        TransferMode::Alias => NSDragOperation::Link,
+    }
+}
+
+/// The drag operation for a drop on an app: one that the source offers.
+fn app_drop_operation(mask: NSDragOperation) -> NSDragOperation {
+    [
+        NSDragOperation::Generic,
+        NSDragOperation::Copy,
+        NSDragOperation::Link,
+        NSDragOperation::Move,
+    ]
+    .into_iter()
+    .find(|op| mask.contains(*op))
+    .unwrap_or(NSDragOperation::None)
+}
+
+/// The resolved folder and the mode of a drop of `files` into `folder`,
+/// or `None` when the drop does nothing (`bf_core::drop::check`).
+fn folder_drop(
+    files: &[PathBuf],
+    folder: &Path,
+    offered: Offered,
+) -> Option<(PathBuf, TransferMode)> {
+    let dest = std::fs::canonicalize(folder).ok()?;
+    let volume = |p: &Path| std::fs::metadata(p).ok().map(|m| m.dev());
+    let dest_volume = volume(&dest);
+    let same_volume = dest_volume.is_some() && files.iter().all(|f| volume(f) == dest_volume);
+    let mode = drop::choose(offered, same_volume)?;
+    drop::check(files, &dest, mode).ok()?;
+    Some((dest, mode))
+}
+
+/// The resolved paths of the file URLs on `pasteboard`. Finder can give
+/// file reference URLs (`file:///.file/id=...`): `filePathURL` converts
+/// them to path URLs.
+fn file_paths(pasteboard: &NSPasteboard) -> Vec<PathBuf> {
+    // SAFETY: `NSPasteboardTypeFileURL` is an immutable static from AppKit.
+    let kind = unsafe { NSPasteboardTypeFileURL };
+    let Some(items) = pasteboard.pasteboardItems() else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let text = item.stringForType(kind)?;
+            let url = NSURL::URLWithString(&text)?.filePathURL()?;
+            std::fs::canonicalize(url.to_file_path()?).ok()
+        })
+        .collect()
+}
+
+/// The ring of a drop place: the accent color, 2 pt wide, like in Finder.
+fn draw_drop_ring(rect: NSRect) {
+    let ring = NSRect::new(
+        NSPoint::new(rect.origin.x + SELECTION_INSET + 1.0, rect.origin.y + 1.0),
+        NSSize::new(
+            (rect.size.width - 2.0 * SELECTION_INSET - 2.0).max(0.0),
+            (rect.size.height - 2.0).max(0.0),
+        ),
+    );
+    NSColor::controlAccentColor().setStroke();
+    let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(ring, 5.0, 5.0);
+    path.setLineWidth(2.0);
+    path.stroke();
 }
 
 /// Converts a key-down `NSEvent` and sends it to the keymap. True when the

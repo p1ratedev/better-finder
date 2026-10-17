@@ -34,17 +34,19 @@ use objc2::{ClassType, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSAnimatablePropertyContainer, NSAppearanceCustomization, NSApplication,
     NSApplicationActivationPolicy, NSApplicationDelegate, NSEventModifierFlags, NSMenu, NSMenuItem,
-    NSPasteboard, NSPasteboardTypeString, NSResponder, NSWindow, NSWindowDelegate, NSWorkspace,
+    NSPasteboard, NSPasteboardTypeString, NSPasteboardURLReadingFileURLsOnlyKey,
+    NSPasteboardWriting, NSResponder, NSWindow, NSWindowDelegate, NSWorkspace,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSArray, NSFileManager, NSNotification, NSObject, NSObjectProtocol, NSString,
-    NSURL,
+    MainThreadMarker, NSArray, NSDictionary, NSFileManager, NSNotification, NSNumber, NSObject,
+    NSObjectProtocol, NSString, NSURL,
 };
 
 use crate::columns;
+use crate::context_menu;
 use crate::debug::{self, trace};
 use crate::editor;
-use crate::file_ops::{self, VolumeInfo};
+use crate::file_ops::{self, TransferMode, TransferReport, VolumeInfo};
 use crate::header::{self, HeaderView};
 use crate::help::HelpModel;
 use crate::icons;
@@ -222,6 +224,9 @@ pub struct AppState {
     /// history forgets their folders (the load that leaves a volume adds
     /// its folder to the history).
     forget_after_load: Vec<PathBuf>,
+    /// The target of the action in progress, when it is not the entry
+    /// under the cursor: the background menu acts on the current folder.
+    target: Option<PathBuf>,
     /// `NSApplication` keeps only a weak reference to its delegate.
     _delegate: Retained<AppDelegate>,
 }
@@ -259,6 +264,22 @@ pub fn after(delay: Duration, work: impl FnOnce() + Send + 'static) {
 /// Runs `work` on the main queue, after the current event.
 pub fn after_now(work: impl FnOnce() + Send + 'static) {
     DispatchQueue::main().exec_async(work);
+}
+
+/// Runs `work` on a new background thread, then `done` with its result on
+/// the main queue.
+pub fn in_background<T: Send + 'static>(
+    name: &str,
+    work: impl FnOnce() -> T + Send + 'static,
+    done: impl FnOnce(T) + Send + 'static,
+) -> io::Result<()> {
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            let result = objc2::rc::autoreleasepool(|_| work());
+            after_now(move || done(result));
+        })?;
+    Ok(())
 }
 
 // ---- App delegate and menu ----
@@ -630,6 +651,7 @@ pub fn run(options: RunOptions) -> ExitCode {
         volumes: Vec::new(),
         eject: EjectState::default(),
         forget_after_load: Vec::new(),
+        target: None,
         _delegate: delegate.clone(),
     };
     if let Some(text) = start_error.or_else(|| config_problem(&diagnostics, &warnings)) {
@@ -658,6 +680,7 @@ pub fn run(options: RunOptions) -> ExitCode {
     if let Some(keymap) = with_ref(|s| s.config.keymap.clone()) {
         sync_menu_keys(&keymap);
     }
+    context_menu::register_services(&app);
 
     app.run();
     ExitCode::SUCCESS
@@ -951,6 +974,11 @@ enum Effect {
     },
     /// Clear the text of the toolbar filter field.
     ClearSearch,
+    /// Show the share menu for `path`, next to the list row `row`.
+    Share {
+        path: PathBuf,
+        row: usize,
+    },
     ReloadConfig,
     WatchConfig,
     Quit,
@@ -958,12 +986,30 @@ enum Effect {
 
 /// Does one action, then updates the views.
 pub fn dispatch(action: Action) {
+    dispatch_to(action, None);
+}
+
+/// Does one action on `target` instead of the entry under the cursor (the
+/// background menu acts on the current folder). Only the actions that use
+/// `current_or_cwd` see the target: `get_info`, `copy_path`, `copy_name`,
+/// and `reveal_in_finder`.
+pub fn dispatch_on(action: Action, target: PathBuf) {
+    dispatch_to(action, Some(target));
+}
+
+fn dispatch_to(action: Action, target: Option<PathBuf>) {
     let Some(mtm) = MainThreadMarker::new() else {
         return;
     };
     let ql_visible = quicklook::is_visible(mtm);
     trace!("action: {action}");
-    let effects = with(|s| s.perform(action, ql_visible)).unwrap_or_default();
+    let effects = with(|s| {
+        s.target = target;
+        let fx = s.perform(action, ql_visible);
+        s.target = None;
+        fx
+    })
+    .unwrap_or_default();
     run_effects(mtm, effects);
     sync_ui();
 }
@@ -1033,6 +1079,7 @@ fn run_effects(mtm: MainThreadMarker, effects: Vec<Effect>) {
                     field.setStringValue(&NSString::from_str(""));
                 }
             }
+            Effect::Share { path, row } => context_menu::share(&path, row),
             Effect::Help => {
                 let Some((ui, height)) =
                     with_ref(|s| (s.ui.clone(), s.help.as_ref().map(|m| m.height(&s.style))))
@@ -1056,15 +1103,17 @@ fn show_help(ui: &Ui, height: Option<f64>) {
     if visible != was_visible {
         smooth::finish();
     }
-    ui.root.set_help(visible, height.unwrap_or(0.0));
-    ui.help.view.setNeedsDisplay(true);
-    let help_responder: &NSResponder = ui.help.view.as_super().as_super();
+    // Read the focus before the overlay hides: AppKit gives the focus of a
+    // hidden view to the window.
     let help_first = ui.window.firstResponder().is_some_and(|r| {
         std::ptr::eq(
             Retained::as_ptr(&r).cast::<u8>(),
             Retained::as_ptr(&ui.help.view).cast::<u8>(),
         )
     });
+    ui.root.set_help(visible, height.unwrap_or(0.0));
+    ui.help.view.setNeedsDisplay(true);
+    let help_responder: &NSResponder = ui.help.view.as_super().as_super();
     if visible && !was_visible {
         // A new overlay starts at the top.
         let clip = ui.help.scroll.contentView();
@@ -1072,10 +1121,40 @@ fn show_help(ui: &Ui, height: Option<f64>) {
         ui.help.scroll.reflectScrolledClipView(&clip);
     }
     if visible && !help_first {
+        HELP_RETURN.with(|r| *r.borrow_mut() = ui.window.firstResponder());
         ui.window.makeFirstResponder(Some(help_responder));
-    } else if !visible && help_first {
-        ui.window.makeFirstResponder(Some(list_responder(&ui.list)));
+    } else if !visible {
+        let before = HELP_RETURN.with(|r| r.borrow_mut().take());
+        if help_first {
+            ui.window
+                .makeFirstResponder(Some(focus_after_help(ui, before.as_deref())));
+        }
     }
+}
+
+thread_local! {
+    /// The responder that had the keyboard focus before the help overlay
+    /// opened.
+    static HELP_RETURN: RefCell<Option<Retained<NSResponder>>> = const { RefCell::new(None) };
+}
+
+/// The responder that gets the keyboard focus when the help overlay
+/// closes: the sidebar when it had the focus before and it is visible,
+/// else the list.
+fn focus_after_help<'a>(ui: &'a Ui, before: Option<&NSResponder>) -> &'a NSResponder {
+    let outline = &ui.sidebar.outline;
+    let was_sidebar = before.is_some_and(|r| {
+        std::ptr::eq(
+            (r as *const NSResponder).cast::<u8>(),
+            Retained::as_ptr(outline).cast::<u8>(),
+        )
+    });
+    if was_sidebar && !outline.isHiddenOrHasHiddenAncestor() {
+        trace!("help: the focus goes back to the sidebar");
+        return outline.as_super().as_super().as_super().as_super();
+    }
+    trace!("help: the focus goes back to the list");
+    list_responder(&ui.list)
 }
 
 /// Shows the text input of `place` and moves the keyboard focus to it.
@@ -1533,11 +1612,121 @@ impl AppState {
         }
     }
 
+    /// The target of an action: the target of `dispatch_on`, else the entry
+    /// under the cursor, else the current folder.
     fn current_or_cwd(&self) -> PathBuf {
+        if let Some(target) = &self.target {
+            return target.clone();
+        }
         self.pane
             .current()
             .map(|e| e.path.clone())
             .unwrap_or_else(|| self.pane.cwd().to_path_buf())
+    }
+
+    /// `copy`: puts the entry under the cursor on the general pasteboard as
+    /// a file URL. A paste in Finder, Mail, or a chat app gets the file.
+    fn copy_file(&mut self) {
+        let Some(entry) = self.pane.current() else {
+            return;
+        };
+        let (name, path) = (entry.name.clone(), entry.path.clone());
+        if copy_files_to_pasteboard(&[path]) {
+            self.set_info(format!("Copied \"{name}\""));
+        } else {
+            self.set_error("Cannot copy to the pasteboard");
+        }
+    }
+
+    /// `paste`: copies the files on the general pasteboard into the current
+    /// folder, on a background thread. It never replaces an item.
+    fn paste(&mut self) {
+        if self.refuse_while_navigating() {
+            return;
+        }
+        let files = pasteboard_files();
+        if files.is_empty() {
+            self.set_info("Nothing to paste");
+            return;
+        }
+        file_ops::transfer(files, self.pane.cwd().to_path_buf(), TransferMode::Copy);
+    }
+
+    /// `duplicate` (`Copy`) and `make_alias` (`Alias`): a copy or an alias
+    /// of the entry under the cursor, in its own folder.
+    fn transfer_current(&mut self, mode: TransferMode) {
+        if self.refuse_while_navigating() {
+            return;
+        }
+        let Some(path) = self.pane.current().map(|e| e.path.clone()) else {
+            return;
+        };
+        if let Some(dir) = path.parent().map(Path::to_path_buf) {
+            file_ops::transfer(vec![path], dir, mode);
+        }
+    }
+
+    /// `compress`: a zip archive of the entry under the cursor, next to it.
+    /// `ditto` runs on a background thread.
+    fn compress(&mut self) {
+        if self.refuse_while_navigating() {
+            return;
+        }
+        let Some(entry) = self.pane.current() else {
+            return;
+        };
+        let (name, path) = (entry.name.clone(), entry.path.clone());
+        let Some(dir) = path.parent().map(Path::to_path_buf) else {
+            return;
+        };
+        let progress = format!("Compressing \"{name}\"\u{2026}");
+        let spawned = in_background(
+            "bf-compress",
+            move || file_ops::compress(&path),
+            move |result| {
+                let message = match &result {
+                    Ok(new) => (format!("Compressed \"{name}\" to \"{new}\""), false),
+                    Err(err) => (format!("Cannot compress \"{name}\": {err}"), true),
+                };
+                let new = result.ok();
+                new_items_finished(vec![dir.clone()], &dir, new, Some(message));
+            },
+        );
+        match spawned {
+            Ok(()) => self.set_progress(progress),
+            Err(err) => self.set_error(format!("Cannot start a thread: {err}")),
+        }
+    }
+
+    /// `get_info`: opens the Finder Info window of the target through
+    /// `osascript`, on a background thread. The first time, macOS asks the
+    /// user to allow Better Finder to control Finder.
+    fn get_info(&mut self) {
+        let path = self.current_or_cwd();
+        let name = file_name(&path);
+        let args = file_ops::info_window_args(&path);
+        let spawned = in_background(
+            "bf-info",
+            move || {
+                Command::new("/usr/bin/osascript")
+                    .args(&args)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .output()
+            },
+            move |output| {
+                let detail = match output {
+                    Ok(output) if output.status.success() => return,
+                    Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                    Err(err) => err.to_string(),
+                };
+                show_error(info_error(&name, &detail));
+            },
+        );
+        if let Err(err) = spawned {
+            self.set_error(format!("Cannot start a thread: {err}"));
+        }
     }
 
     fn perform(&mut self, action: Action, ql_visible: bool) -> Vec<Effect> {
@@ -1666,6 +1855,20 @@ impl AppState {
                     self.set_info(format!("Copied \"{name}\""));
                 } else {
                     self.set_error("Cannot copy to the pasteboard");
+                }
+            }
+            Action::Copy => self.copy_file(),
+            Action::Paste => self.paste(),
+            Action::Duplicate => self.transfer_current(TransferMode::Copy),
+            Action::MakeAlias => self.transfer_current(TransferMode::Alias),
+            Action::Compress => self.compress(),
+            Action::GetInfo => self.get_info(),
+            Action::Share => {
+                if let Some(entry) = self.pane.current() {
+                    fx.push(Effect::Share {
+                        path: entry.path.clone(),
+                        row: self.pane.cursor(),
+                    });
                 }
             }
             Action::OpenTerminal => {
@@ -2039,6 +2242,60 @@ fn copy_to_pasteboard(text: &str) -> bool {
     pasteboard.setString_forType(&NSString::from_str(text), kind)
 }
 
+/// Puts `paths` on the general pasteboard as file URLs, like a copy in Finder.
+fn copy_files_to_pasteboard(paths: &[PathBuf]) -> bool {
+    let urls: Vec<Retained<NSURL>> = paths.iter().filter_map(NSURL::from_file_path).collect();
+    if urls.is_empty() {
+        return false;
+    }
+    let objects: Vec<&ProtocolObject<dyn NSPasteboardWriting>> = urls
+        .iter()
+        .map(|url| ProtocolObject::from_ref(&**url))
+        .collect();
+    let pasteboard = NSPasteboard::generalPasteboard();
+    pasteboard.clearContents();
+    pasteboard.writeObjects(&NSArray::from_slice(&objects))
+}
+
+/// The file paths on the general pasteboard (only file URLs, for example
+/// after a copy in Finder).
+pub fn pasteboard_files() -> Vec<PathBuf> {
+    let pasteboard = NSPasteboard::generalPasteboard();
+    let classes = NSArray::from_slice(&[NSURL::class()]);
+    // SAFETY: The option key is an immutable static from AppKit.
+    let key = unsafe { NSPasteboardURLReadingFileURLsOnlyKey };
+    let yes = NSNumber::new_bool(true);
+    let value: &AnyObject = &yes;
+    let options = NSDictionary::from_slices(&[key], &[value]);
+    // SAFETY: The classes array holds `NSURL`, which conforms to
+    // `NSPasteboardReading`. The option has the documented `NSNumber` type.
+    let objects = unsafe { pasteboard.readObjectsForClasses_options(&classes, Some(&options)) };
+    objects
+        .map(|objects| {
+            objects
+                .iter()
+                .filter_map(|object| object.downcast::<NSURL>().ok())
+                .filter_map(|url| url.to_file_path())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The status text for a failed `get_info`. When macOS refuses the Apple
+/// Event, the text tells the user where to allow it.
+fn info_error(name: &str, detail: &str) -> String {
+    let refused = ["-1743", "-1744", "Not authorized", "not allowed"]
+        .iter()
+        .any(|code| detail.contains(code));
+    if refused {
+        "Allow Better Finder to control Finder: System Settings > Privacy & Security > Automation"
+            .to_string()
+    } else {
+        let detail = detail.lines().next().unwrap_or("").trim();
+        format!("Cannot show the info of \"{name}\": {detail}")
+    }
+}
+
 /// Runs `/usr/bin/open` with `args` and does not wait. A thread waits for
 /// the exit and shows `failure` when `open` fails.
 fn spawn_open(args: &[OsString], failure: String) -> io::Result<()> {
@@ -2073,10 +2330,79 @@ fn spawn_checked(program: &str, args: &[OsString], failure: String) -> io::Resul
     Ok(())
 }
 
-fn show_error(text: String) {
+pub fn show_error(text: String) {
     if with(|s| s.set_error(text)).is_some() {
         redraw_status();
     }
+}
+
+/// Shows a progress message. The result of the task replaces it.
+pub fn show_progress(text: String) {
+    if with(|s| s.set_progress(text)).is_some() {
+        redraw_status();
+    }
+}
+
+/// A `file_ops::transfer` is complete: refresh, select, and one message.
+pub fn transfer_finished(report: TransferReport) {
+    let first_new = report.results.iter().find_map(|r| match r {
+        bf_core::transfer::ItemResult::Done { new, .. } => Some(new.clone()),
+        _ => None,
+    });
+    let message = bf_core::transfer::summary(&report.results);
+    new_items_finished(report.changed, &report.dest_dir, first_new, message);
+}
+
+/// A background file operation is complete. Shows `message`. When the
+/// current folder is in `changed`, it reads the folder again, and the
+/// cursor goes to `new_name` in `dir` when the list shows it.
+fn new_items_finished(
+    changed: Vec<PathBuf>,
+    dir: &Path,
+    new_name: Option<String>,
+    message: Option<(String, bool)>,
+) {
+    let done = with(|s| {
+        if let Some((text, error)) = message {
+            s.set_message(text, error);
+        }
+        let cwd = s.pane.cwd().to_path_buf();
+        if !changed.contains(&cwd) {
+            return;
+        }
+        if let Some(name) = new_name.filter(|_| dir == cwd) {
+            s.pending_select = Some((cwd, name));
+        }
+        s.refresh_after_change();
+    });
+    if done.is_some() {
+        sync_ui();
+    }
+}
+
+/// Puts the cursor on the entry at `path`. The context menu calls it before
+/// an action on its row: a refresh can change the rows while the menu is
+/// open. False when the list does not show `path`.
+pub fn cursor_to(path: &Path) -> bool {
+    let moved = with(|s| {
+        if s.pane.current().is_some_and(|e| e.path == path) {
+            return Some(false);
+        }
+        let row = (0..s.pane.visible_len())
+            .find(|&i| s.pane.visible_entry(i).is_some_and(|e| e.path == path))?;
+        s.pane.set_cursor(row);
+        Some(true)
+    })
+    .flatten();
+    if moved == Some(true) {
+        sync_ui();
+    }
+    moved.is_some()
+}
+
+/// True when the list shows the folder `dir`.
+pub fn shows_folder(dir: &Path) -> bool {
+    with_ref(|s| s.pane.cwd() == dir).unwrap_or(false)
 }
 
 fn redraw_status() {

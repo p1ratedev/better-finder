@@ -9,12 +9,15 @@
 pub mod action;
 pub mod color;
 pub mod config;
+pub mod drop;
 pub mod filter;
 pub mod format;
 pub mod fs;
 pub mod keymap;
+pub mod names;
 pub mod pane;
 pub mod sort;
+pub mod transfer;
 pub mod viewport;
 
 pub use action::Action;
