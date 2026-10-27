@@ -28,6 +28,9 @@ cp target/release/better-finder "$app/Contents/MacOS/better-finder"
 # scripts/make-icon.swift makes the icon file.
 cp assets/AppIcon.icns "$app/Contents/Resources/AppIcon.icns"
 
+# CFBundleDocumentTypes: the app can open folders (public.folder). With the
+# rank Alternate, Finder stays the default app until the user changes it.
+# README.md, "Use Better Finder as the file viewer", tells how.
 cat > "$app/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -47,6 +50,21 @@ cat > "$app/Contents/Info.plist" <<EOF
     <string>APPL</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Folder</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.folder</string>
+            </array>
+        </dict>
+    </array>
     <key>CFBundleShortVersionString</key>
     <string>${version}</string>
     <key>CFBundleVersion</key>

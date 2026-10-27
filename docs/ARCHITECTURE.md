@@ -51,6 +51,7 @@ This is the Ghostty model: a core library and a thin native shell. The shell con
 | `names` | New names for copies, aliases, and archives, like Finder: `report copy.pdf`, `file 2.txt`, `report.pdf alias`, `report.pdf.zip`. Pure functions. |
 | `transfer` | The rules of a copy, move, or alias into a folder: the name style, the "inside itself" test, and the status text. Pure functions. |
 | `drop` | The Finder rules of a drop: the transfer mode from the offered operations and the volumes, and the checks that stop a drop (a move into the same folder, a folder into itself). Pure functions. |
+| `viewer` | The open requests of other apps: from the paths to one folder and the name to put the cursor on. Pure functions, except `Kind::of`. |
 
 The public API of `bf-core` is the contract with `bf-app`. The doc comments in the source are the specification.
 
@@ -74,6 +75,7 @@ The public API of `bf-core` is the contract with `bf-app`. The doc comments in t
 | `smooth` | The smooth scroll driver for the list and the help overlay. A display link moves the clip view and the cursor highlight with an ease-out curve. |
 | `file_ops` | File system helpers with data-safety rules, for example a rename that never replaces an item. `transfer` copies, moves, or makes aliases of items in a folder on a background thread, and `compress` runs `ditto`. They never replace an item. |
 | `context_menu` | The context menu of the list (a right click or a control click), the Open With and Share parts of the actions, and the Services of the list. |
+| `file_viewer` | The open requests of other apps (`application:openURLs:`): the paths of the URLs, the trace of the Apple Event, and the test for the `NSFileViewer` default. |
 | `quicklook` | `QLPreviewPanel` data source and delegate. |
 | `editor` | Opens a text file in the `editor` command, in a new window of Ghostty or Terminal. It runs `osascript`. The effect is `OpenFile`; a background thread checks for text. |
 | `icons` | File icons from `NSWorkspace`, with a cache. Each icon renders one time into a bitmap at the draw size. |
@@ -121,6 +123,28 @@ When the help overlay is open, it has the keyboard focus. `app::help_key` sends 
 - When the cursor moves and the panel is visible, the view calls `reloadData`.
 - The delegate `previewPanel:handleEvent:` sends key events back to the keymap. So `j`, `k`, and the arrows move the cursor and change the preview, like Finder.
 - `Space` and `Escape` close the panel.
+
+### File viewer requests
+
+Better Finder can replace Finder as the file viewer of the Mac (README, "Use Better Finder as the file viewer"). Then other apps send it their requests:
+
+- `open <folder>`, and a folder that an app opens: Launch Services sends the request to the default app of `public.folder`. `scripts/bundle.sh` declares the type in `CFBundleDocumentTypes` (role `Viewer`, rank `Alternate`).
+- "Show in Finder" and `open -R <file>`: `NSWorkspace` (`activateFileViewerSelectingURLs:` and `selectFile:inFileViewerRootedAtPath:`) sends the request to the app in the `NSFileViewer` default.
+
+On macOS 26, all of these requests arrive as the Apple Event `aevt`/`odoc`, not as the Finder event `misc`/`mvis`. `BETTER_FINDER_TRACE=1` prints the event. The flow:
+
+1. AppKit calls `application:openURLs:` of the app delegate. When the request starts the app, the call comes before `applicationDidFinishLaunching:`.
+2. `app::show_items` reads the kind of each path (`viewer::Kind::of`) on a background thread.
+3. `viewer::target` gives the folder and the name: a folder opens, and a file opens its folder with the cursor on the file. The first usable path decides, because the app has one window.
+4. The prompt, the help overlay, and the filter close. The folder loads, the cursor goes to the name (`pending_select`), and the window comes to the front.
+
+Limits:
+
+- The event is the same for "Show in Finder" and for an open request. So "Show in Finder" of a folder opens the folder. Finder selects the folder in its parent folder.
+- When the request starts the app, the start folder shows for a short time before the requested folder. The first frame comes before AppKit delivers the event, and the launch time is more important.
+- Apps that script Finder with AppleScript still go to Finder.
+
+`reveal_in_finder` uses `activateFileViewerSelectingURLs:`. When `NSFileViewer` names Better Finder, that call comes back to this app. So then the action runs a Finder script (`reveal`) through `osascript`, like `get_info`.
 
 ### Config reload
 

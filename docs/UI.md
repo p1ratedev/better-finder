@@ -344,6 +344,7 @@ Data safety comes first. These actions never replace an item and never delete an
 - `compress`: `/usr/bin/ditto -c -k --sequesterRsrc` on a background thread. A folder also gets `--keepParent`, so the archive holds the folder. A file does not: else the archive also holds the name of its folder. The name is `report.pdf.zip`, then `report.pdf 2.zip`. No default key.
 - `get_info` (`cmd+i`): opens the Finder Info window through `osascript` on a background thread. The path goes to the script as an argument, never in the script text. Without an entry under the cursor, it shows the info of the current folder. The first time, macOS asks the user to allow Better Finder to control Finder. When macOS refuses, the status bar says: allow it in System Settings > Privacy & Security > Automation.
 - `share`: shows the macOS share menu (`NSSharingServicePicker`) next to the cursor row. No default key.
+- `reveal_in_finder`: shows the item in Finder (`activateFileViewerSelectingURLs:`). When the `NSFileViewer` default names Better Finder, that call comes back to Better Finder. Then the action uses a Finder script (`reveal`), like `get_info`, with the same permission message. No default key.
 
 How the copies work:
 
