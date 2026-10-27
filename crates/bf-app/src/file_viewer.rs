@@ -4,8 +4,8 @@
 //! URLs to `application:openURLs:` of the app delegate, and the delegate
 //! gives the paths to `app::show_items`. Two senders were seen on macOS 26:
 //!
-//! - Launch Services, for the default app of `public.folder`
-//!   (`open ~/Downloads`).
+//! - Launch Services, for `open -a "Better Finder" <folder>`. (macOS 26
+//!   does not let Better Finder be the default app of `public.folder`.)
 //! - `NSWorkspace`, for the app in the `NSFileViewer` default.
 //!   `activateFileViewerSelectingURLs:` ("Show in Finder") and
 //!   `selectFile:inFileViewerRootedAtPath:` (`open -R <file>`) both send

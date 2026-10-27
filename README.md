@@ -60,21 +60,16 @@ cargo run --release -p bf-app -- ~/Downloads
 
 ### Use Better Finder as the file viewer
 
-Other apps can show their files in Better Finder instead of Finder. Two settings control it:
-
-1. `NSFileViewer`: "Show in Finder" in other apps and `open -R <file>` go to this app.
-2. The default app of `public.folder`: `open <folder>`, and the folders that other apps open, go to this app.
-
-Install the app, then run:
+Other apps can show their files in Better Finder instead of Finder: "Show in Finder" in an app and `open -R <file>` go to the app in the `NSFileViewer` default. Install the app, then run:
 
 ```sh
 defaults write -g NSFileViewer -string com.p1ratedev.better-finder
-swift -e 'import Foundation; _ = LSSetDefaultRoleHandlerForContentType("public.folder" as CFString, .all, "com.p1ratedev.better-finder" as CFString)'
 ```
 
 A folder opens in the window. A file opens its folder with the cursor on the file. With more than one item, the first item decides. Limits:
 
 - macOS sends the same request for "Show in Finder" and for "open". So "Show in Finder" of a folder opens the folder.
+- `open <folder>`, and the folders that other apps open, still go to Finder. The app declares the folder type (`public.folder`), but macOS 26 does not let you change the default app of folders: `LSSetDefaultRoleHandlerForContentType` and `NSWorkspace setDefaultApplicationAtURL:toOpenContentType:` return error -50, also for Finder. `open -a "Better Finder" <folder>` works.
 - Apps that script Finder with AppleScript still open Finder.
 - The `reveal_in_finder` action ("Show in Finder" in the context menu) still opens Finder. It then uses a Finder script, so macOS asks one time for permission to control Finder.
 
@@ -82,7 +77,6 @@ To go back to Finder:
 
 ```sh
 defaults delete -g NSFileViewer
-swift -e 'import Foundation; _ = LSSetDefaultRoleHandlerForContentType("public.folder" as CFString, .all, "com.apple.finder" as CFString)'
 ```
 
 ## A short tour

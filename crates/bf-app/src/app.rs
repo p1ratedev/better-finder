@@ -300,10 +300,10 @@ define_class!(
 
     // SAFETY: `NSApplicationDelegate` has no safety requirements. The signatures match.
     unsafe impl NSApplicationDelegate for AppDelegate {
-        /// An open request from another app (`aevt`/`odoc`): the default
-        /// app of `public.folder` opens a folder, or the app in the
-        /// `NSFileViewer` default shows a file ("Show in Finder"). On a
-        /// cold start, it comes before `applicationDidFinishLaunching:`.
+        /// An open request from another app (`aevt`/`odoc`): an app opens
+        /// a folder in Better Finder, or `NSWorkspace` shows a file in the
+        /// app of the `NSFileViewer` default ("Show in Finder"). On a cold
+        /// start, it comes before `applicationDidFinishLaunching:`.
         #[unsafe(method(application:openURLs:))]
         fn application_open_urls(&self, _application: &NSApplication, urls: &NSArray<NSURL>) {
             file_viewer::trace_current_event("open URLs");

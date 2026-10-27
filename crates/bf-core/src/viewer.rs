@@ -3,8 +3,8 @@
 //! When Better Finder is the file viewer of the Mac, two kinds of request
 //! come to it as an open request (the Apple Event `aevt`/`odoc`):
 //!
-//! - An app opens a folder, for example `open ~/Downloads`. Launch
-//!   Services sends it to the default app of `public.folder`.
+//! - An app opens a folder in Better Finder, for example
+//!   `open -a "Better Finder" ~/Downloads`. Launch Services sends it.
 //! - An app shows an item in its folder, for example "Show in Finder" or
 //!   `open -R <file>`. `NSWorkspace` sends it to the app in the
 //!   `NSFileViewer` default.

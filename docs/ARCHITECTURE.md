@@ -128,8 +128,8 @@ When the help overlay is open, it has the keyboard focus. `app::help_key` sends 
 
 Better Finder can replace Finder as the file viewer of the Mac (README, "Use Better Finder as the file viewer"). Then other apps send it their requests:
 
-- `open <folder>`, and a folder that an app opens: Launch Services sends the request to the default app of `public.folder`. `scripts/bundle.sh` declares the type in `CFBundleDocumentTypes` (role `Viewer`, rank `Alternate`).
 - "Show in Finder" and `open -R <file>`: `NSWorkspace` (`activateFileViewerSelectingURLs:` and `selectFile:inFileViewerRootedAtPath:`) sends the request to the app in the `NSFileViewer` default.
+- `open -a "Better Finder" <folder>`, and a folder in a default app of `public.folder`: Launch Services sends the request. `scripts/bundle.sh` declares the type in `CFBundleDocumentTypes` (role `Viewer`, rank `Alternate`). macOS 26 refuses a change of the default app of `public.folder`: `LSSetDefaultRoleHandlerForContentType` and `NSWorkspace setDefaultApplicationAtURL:toOpenContentType:` return -50 (`paramErr`), also for Finder. So `open <folder>` still goes to Finder.
 
 On macOS 26, all of these requests arrive as the Apple Event `aevt`/`odoc`, not as the Finder event `misc`/`mvis`. `BETTER_FINDER_TRACE=1` prints the event. The flow:
 
@@ -142,6 +142,7 @@ Limits:
 
 - The event is the same for "Show in Finder" and for an open request. So "Show in Finder" of a folder opens the folder. Finder selects the folder in its parent folder.
 - When the request starts the app, the start folder shows for a short time before the requested folder. The first frame comes before AppKit delivers the event, and the launch time is more important.
+- `open <folder>` goes to Finder (see above).
 - Apps that script Finder with AppleScript still go to Finder.
 
 `reveal_in_finder` uses `activateFileViewerSelectingURLs:`. When `NSFileViewer` names Better Finder, that call comes back to this app. So then the action runs a Finder script (`reveal`) through `osascript`, like `get_info`.
