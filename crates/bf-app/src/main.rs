@@ -10,6 +10,7 @@ mod context_menu;
 mod debug;
 mod editor;
 mod file_ops;
+mod file_viewer;
 mod goto_panel;
 mod header;
 mod help;

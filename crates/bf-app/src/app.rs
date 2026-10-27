@@ -22,6 +22,7 @@ use bf_core::filter::is_path_query;
 use bf_core::fs::{display_path, expand_path, home_dir};
 use bf_core::keymap::{Key, KeyPress, NamedKey};
 use bf_core::pane::{LoadKind, PaneOptions};
+use bf_core::viewer::{self, Kind};
 use bf_core::viewport::{self, Motion, Position, Viewport};
 use bf_core::{
     Action, Config, Entry, EntryKind, KeyEvent, KeyOutcome, Keymap, KeymapState, LoadRequest,
@@ -47,6 +48,7 @@ use crate::context_menu;
 use crate::debug::{self, trace};
 use crate::editor;
 use crate::file_ops::{self, TransferMode, TransferReport, VolumeInfo};
+use crate::file_viewer;
 use crate::header::{self, HeaderView};
 use crate::help::HelpModel;
 use crate::icons;
@@ -298,6 +300,16 @@ define_class!(
 
     // SAFETY: `NSApplicationDelegate` has no safety requirements. The signatures match.
     unsafe impl NSApplicationDelegate for AppDelegate {
+        /// An open request from another app (`aevt`/`odoc`): an app opens
+        /// a folder in Better Finder, or `NSWorkspace` shows a file in the
+        /// app of the `NSFileViewer` default ("Show in Finder"). On a cold
+        /// start, it comes before `applicationDidFinishLaunching:`.
+        #[unsafe(method(application:openURLs:))]
+        fn application_open_urls(&self, _application: &NSApplication, urls: &NSArray<NSURL>) {
+            file_viewer::trace_current_event("open URLs");
+            show_items(file_viewer::url_paths(urls));
+        }
+
         #[unsafe(method(applicationDidFinishLaunching:))]
         fn application_did_finish_launching(&self, _notification: &NSNotification) {
             let app = NSApplication::sharedApplication(self.mtm());
@@ -1023,12 +1035,7 @@ fn run_effects(mtm: MainThreadMarker, effects: Vec<Effect>) {
                 editor,
                 terminal,
             } => open_text_or_default(path, editor, terminal),
-            Effect::Reveal(path) => {
-                if let Some(url) = NSURL::from_file_path(&path) {
-                    let urls = NSArray::from_retained_slice(&[url]);
-                    NSWorkspace::sharedWorkspace().activateFileViewerSelectingURLs(&urls);
-                }
-            }
+            Effect::Reveal(path) => reveal_in_finder(&path),
             Effect::QuickLookToggle => quicklook::toggle(mtm),
             Effect::QuickLookClose => quicklook::close(mtm),
             Effect::OpenPrompt {
@@ -1698,33 +1705,11 @@ impl AppState {
         }
     }
 
-    /// `get_info`: opens the Finder Info window of the target through
-    /// `osascript`, on a background thread. The first time, macOS asks the
-    /// user to allow Better Finder to control Finder.
+    /// `get_info`: opens the Finder Info window of the target.
     fn get_info(&mut self) {
         let path = self.current_or_cwd();
-        let name = file_name(&path);
-        let args = file_ops::info_window_args(&path);
-        let spawned = in_background(
-            "bf-info",
-            move || {
-                Command::new("/usr/bin/osascript")
-                    .args(&args)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::piped())
-                    .output()
-            },
-            move |output| {
-                let detail = match output {
-                    Ok(output) if output.status.success() => return,
-                    Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_string(),
-                    Err(err) => err.to_string(),
-                };
-                show_error(info_error(&name, &detail));
-            },
-        );
-        if let Err(err) = spawned {
+        let failure = format!("Cannot show the info of \"{}\"", file_name(&path));
+        if let Err(err) = run_finder_script(file_ops::info_window_args(&path), failure) {
             self.set_error(format!("Cannot start a thread: {err}"));
         }
     }
@@ -2281,9 +2266,35 @@ pub fn pasteboard_files() -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-/// The status text for a failed `get_info`. When macOS refuses the Apple
-/// Event, the text tells the user where to allow it.
-fn info_error(name: &str, detail: &str) -> String {
+/// Runs a Finder script (`osascript` with `args`) on a background thread.
+/// The first time, macOS asks the user to allow Better Finder to control
+/// Finder. When the script fails, the status bar shows `failure` and the
+/// reason.
+fn run_finder_script(args: Vec<OsString>, failure: String) -> io::Result<()> {
+    in_background(
+        "bf-finder",
+        move || {
+            Command::new("/usr/bin/osascript")
+                .args(&args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .output()
+        },
+        move |output| {
+            let detail = match output {
+                Ok(output) if output.status.success() => return,
+                Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                Err(err) => err.to_string(),
+            };
+            show_error(finder_error(&failure, &detail));
+        },
+    )
+}
+
+/// The status text for a failed Finder script. When macOS refuses the
+/// Apple Event, the text tells the user where to allow it.
+fn finder_error(failure: &str, detail: &str) -> String {
     let refused = ["-1743", "-1744", "Not authorized", "not allowed"]
         .iter()
         .any(|code| detail.contains(code));
@@ -2292,7 +2303,25 @@ fn info_error(name: &str, detail: &str) -> String {
             .to_string()
     } else {
         let detail = detail.lines().next().unwrap_or("").trim();
-        format!("Cannot show the info of \"{name}\": {detail}")
+        format!("{failure}: {detail}")
+    }
+}
+
+/// `reveal_in_finder`: shows `path` in Finder. `NSWorkspace` sends the
+/// request to the app in the `NSFileViewer` default. When that app is
+/// Better Finder, the request comes back to this app, so a Finder script
+/// shows the item.
+fn reveal_in_finder(path: &Path) {
+    if !file_viewer::is_default_viewer() {
+        if let Some(url) = NSURL::from_file_path(path) {
+            let urls = NSArray::from_retained_slice(&[url]);
+            NSWorkspace::sharedWorkspace().activateFileViewerSelectingURLs(&urls);
+        }
+        return;
+    }
+    let failure = format!("Cannot show \"{}\" in Finder", file_name(path));
+    if let Err(err) = run_finder_script(file_ops::reveal_args(path), failure) {
+        show_error(format!("Cannot start a thread: {err}"));
     }
 }
 
@@ -2436,6 +2465,93 @@ fn loading_check(generation: u64) {
     });
     if show == Some(true) {
         redraw_status();
+    }
+}
+
+// ---- File viewer requests ----
+
+/// Shows the items of an open request from another app
+/// (`bf_core::viewer`). A thread reads the kinds of the paths, because a
+/// read on a network volume can be slow. Then `show_request_target`
+/// continues on the main thread.
+pub fn show_items(paths: Vec<PathBuf>) {
+    trace!("file viewer: open {paths:?}");
+    if paths.is_empty() {
+        return;
+    }
+    let spawned = in_background(
+        "bf-viewer",
+        move || {
+            paths
+                .into_iter()
+                .map(|path| {
+                    let kind = Kind::of(&path);
+                    (path, kind)
+                })
+                .collect::<Vec<_>>()
+        },
+        show_request_target,
+    );
+    if let Err(err) = spawned {
+        show_error(format!("Cannot start a thread: {err}"));
+    }
+}
+
+/// Loads the target folder of a request, puts the cursor on the item,
+/// and brings the window to the front.
+fn show_request_target(items: Vec<(PathBuf, Kind)>) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let effects = with(|s| {
+        let mut fx = Vec::new();
+        match viewer::target(&items) {
+            Some(target) => s.show_target(target, &mut fx),
+            None => {
+                if let Some((path, _)) = items.first() {
+                    s.set_error(format!("No such file or folder: {}", display_path(path)));
+                }
+            }
+        }
+        fx
+    })
+    .unwrap_or_default();
+    run_effects(mtm, effects);
+    sync_ui();
+    let app = NSApplication::sharedApplication(mtm);
+    // The request comes from another app: the user expects this window.
+    #[allow(deprecated)]
+    app.activateIgnoringOtherApps(true);
+    // Before the first load completes, `show_window` shows the window.
+    let window = with_ref(|s| s.window_shown.then(|| s.ui.window.clone())).flatten();
+    if let Some(window) = window {
+        window.makeKeyAndOrderFront(None);
+    }
+}
+
+impl AppState {
+    /// Loads `target.folder` and puts the cursor on `target.select` after
+    /// the load. The prompt, the help overlay, and the filter close first,
+    /// so that the entry is visible.
+    fn show_target(&mut self, target: viewer::Target, fx: &mut Vec<Effect>) {
+        self.reveal_cursor = true;
+        if self.message.as_ref().is_some_and(|m| m.error) {
+            self.message = None;
+        }
+        if self.prompt.is_some() {
+            self.close_prompt(fx);
+        }
+        if self.help.take().is_some() {
+            fx.push(Effect::Help);
+        }
+        if !self.pane.filter().is_empty() {
+            self.pane.clear_filter();
+            self.content_dirty = true;
+            fx.push(Effect::ClearSearch);
+        }
+        self.pending_select = target.select.map(|name| (target.folder.clone(), name));
+        let request = self.pane.navigate_to(target.folder);
+        self.start_load(request);
     }
 }
 

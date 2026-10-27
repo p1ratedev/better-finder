@@ -58,6 +58,27 @@ To run it from a terminal without an install:
 cargo run --release -p bf-app -- ~/Downloads
 ```
 
+### Use Better Finder as the file viewer
+
+Other apps can show their files in Better Finder instead of Finder: "Show in Finder" in an app and `open -R <file>` go to the app in the `NSFileViewer` default. Install the app, then run:
+
+```sh
+defaults write -g NSFileViewer -string com.p1ratedev.better-finder
+```
+
+A folder opens in the window. A file opens its folder with the cursor on the file. With more than one item, the first item decides. Limits:
+
+- macOS sends the same request for "Show in Finder" and for "open". So "Show in Finder" of a folder opens the folder.
+- `open <folder>`, and the folders that other apps open, still go to Finder. The app declares the folder type (`public.folder`), but macOS 26 does not let you change the default app of folders: `LSSetDefaultRoleHandlerForContentType` and `NSWorkspace setDefaultApplicationAtURL:toOpenContentType:` return error -50, also for Finder. `open -a "Better Finder" <folder>` works.
+- Apps that script Finder with AppleScript still open Finder.
+- The `reveal_in_finder` action ("Show in Finder" in the context menu) still opens Finder. It then uses a Finder script, so macOS asks one time for permission to control Finder.
+
+To go back to Finder:
+
+```sh
+defaults delete -g NSFileViewer
+```
+
 ## A short tour
 
 | Keys | What they do |
@@ -208,7 +229,7 @@ The numbers come from one Apple Silicon Mac, with `BETTER_FINDER_TRACE=1` and `f
 
 Better Finder follows the Ghostty model: a core library and a thin native shell.
 
-- **`bf-core`** is pure Rust, with no UI code: the config parser, the keymap, the directory listing, sort, filter, navigation state, the scroll math, the names of new files, and the drop rules. 173 unit tests cover it.
+- **`bf-core`** is pure Rust, with no UI code: the config parser, the keymap, the directory listing, sort, filter, navigation state, the scroll math, the names of new files, and the drop rules. 182 unit tests cover it.
 - **`bf-app`** is the native macOS app, written with AppKit through [`objc2`](https://github.com/madsmtm/objc2):
   - A custom list view draws only the visible rows, so a frame costs the same for 50 files or 100 000.
   - `Space` opens the real `QLPreviewPanel`.

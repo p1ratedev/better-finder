@@ -18,6 +18,7 @@ pub mod names;
 pub mod pane;
 pub mod sort;
 pub mod transfer;
+pub mod viewer;
 pub mod viewport;
 
 pub use action::Action;

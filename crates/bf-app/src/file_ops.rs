@@ -381,15 +381,29 @@ pub fn compress(source: &Path) -> io::Result<String> {
 }
 
 /// The `osascript` arguments that open the Finder Info window of `path`.
-/// The path is an argument of the script, not a part of its text, so it
-/// needs no quotes.
 pub fn info_window_args(path: &Path) -> Vec<OsString> {
+    finder_script_args(
+        "open information window of (POSIX file (item 1 of argv) as alias)",
+        path,
+    )
+}
+
+/// The `osascript` arguments that show `path` in a Finder window, with the
+/// item selected.
+pub fn reveal_args(path: &Path) -> Vec<OsString> {
+    finder_script_args("reveal (POSIX file (item 1 of argv) as alias)", path)
+}
+
+/// The `osascript` arguments of a script that activates Finder and runs
+/// `command` in it. In `command`, `item 1 of argv` is `path`. The path is
+/// an argument of the script, not a part of its text, so it needs no quotes.
+fn finder_script_args(command: &str, path: &Path) -> Vec<OsString> {
     let mut args = Vec::new();
     for line in [
         "on run argv",
         "tell application \"Finder\"",
         "activate",
-        "open information window of (POSIX file (item 1 of argv) as alias)",
+        command,
         "end tell",
         "end run",
     ] {
@@ -648,19 +662,27 @@ mod tests {
     }
 
     #[test]
-    fn info_window_path_is_an_argument() {
+    fn finder_script_path_is_an_argument() {
         let path = "/tmp/a \"b\".txt";
-        let args = info_window_args(Path::new(path));
-        assert_eq!(
-            args.last().map(|a| a.to_string_lossy().into_owned()),
-            Some(path.into())
-        );
-        assert_eq!(args.iter().filter(|a| *a == "-e").count(), 6);
-        assert!(
-            !args[..args.len() - 1]
-                .iter()
-                .any(|a| a.to_string_lossy().contains(path))
-        );
+        for (args, command) in [
+            (info_window_args(Path::new(path)), "open information window"),
+            (reveal_args(Path::new(path)), "reveal"),
+        ] {
+            assert_eq!(
+                args.last().map(|a| a.to_string_lossy().into_owned()),
+                Some(path.into())
+            );
+            assert_eq!(args.iter().filter(|a| *a == "-e").count(), 6);
+            assert!(
+                !args[..args.len() - 1]
+                    .iter()
+                    .any(|a| a.to_string_lossy().contains(path))
+            );
+            assert!(
+                args.iter()
+                    .any(|a| a.to_string_lossy().starts_with(command))
+            );
+        }
     }
 
     #[test]
