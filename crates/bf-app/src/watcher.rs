@@ -419,6 +419,12 @@ pub fn watch_directory(path: &Path) {
     });
 }
 
+/// Stops the directory stream. A remote folder has no stream: the
+/// `refresh` action reads it again.
+pub fn stop_directory() {
+    on_queue(|_, streams| streams.directory = None);
+}
+
 /// Stops the directory stream when it watches a folder on the volume at
 /// `mount`. Then it runs `then` on the watcher queue, so `then` runs after
 /// the stop. Keep `then` short: for example, let it start a thread.

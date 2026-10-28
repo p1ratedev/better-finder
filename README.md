@@ -25,13 +25,14 @@ Finder is good with a mouse. It is slow with a keyboard. Better Finder keeps the
 ## Highlights
 
 - ⚡ **Fast.** The window shows in about 150 ms. A folder with 10 000 files loads in about 30 ms, on a background thread. The app uses about 40 to 60 MB of memory.
-- ⌨️ **Keyboard first.** vim keys and Finder keys work together. Key sequences such as `gd` (go to Downloads) work. You can bind any key to any of the 42 actions.
+- ⌨️ **Keyboard first.** vim keys and Finder keys work together. Key sequences such as `gd` (go to Downloads) work. You can bind any key to any of the 43 actions.
 - 🧈 **Smooth scroll, like nvim.** `ctrl+d` and `ctrl+u` move the view and the cursor together, with a short animation. `j` and `k` stay instant.
 - 📝 **One dotfile.** `~/.config/better-finder/config` uses the Ghostty syntax. The app reloads it when you save it.
 - 👀 **Native Quick Look.** Press `Space` to preview a file, like in Finder.
 - 🖱️ **Drag and drop.** Drag a file to Telegram, Mail, or Finder. Drop files on a folder row, on an app, or on the list. The Finder rules apply: a move on the same volume, `option` for a copy, `control` for an alias.
 - 🪟 **The Finder look.** A glass sidebar with Favorites and Locations, a toolbar, a column header that sorts, the Kind column, sizes and dates in your locale, and a path bar.
 - 💽 **Disks.** Disks, disk images, and network shares show in the sidebar when they mount. `cmd+e` ejects them.
+- 🌐 **Remote folders over SSH.** Add `remote = admin@mac-mini` to the config, and the files of that Mac (or of a Linux server) show in the sidebar. Browse, sort, filter, and preview them with `Space`. The app uses your own `ssh` setup. See [Remote folders over SSH](#remote-folders-over-ssh).
 - 🖱️ **The Finder context menu.** A right click shows the Finder items: Open With, Duplicate, Make Alias, Compress, Copy and Paste of files, Get Info, Share, and the Services.
 - ✍️ **Your editor.** `Enter` on a text file opens it in nvim (or another editor) in a new Ghostty or Terminal window.
 - 🛡️ **Safe file operations.** A rename, a paste, or a duplicate never replaces a file. A delete moves the file to the Trash. Destructive keys do not repeat when you hold them.
@@ -146,6 +147,7 @@ background-opacity = 0.97
 # Sidebar
 sidebar-item = ~/Projects
 sidebar-item = ~/Downloads
+remote = admin@mac-mini
 
 # List
 columns = size,kind,modified
@@ -177,6 +179,55 @@ better-finder +list-keybinds           # the active key bindings
 better-finder +list-actions            # every action
 better-finder +validate-config         # check the config file for errors
 ```
+
+## Remote folders over SSH
+
+Better Finder can show the files of another Mac or of a Linux server. It runs the `ssh` command of macOS. So it uses your `~/.ssh/config`, your keys, the SSH agent, and `known_hosts`. The other computer needs only an SSH server.
+
+### Set up
+
+1. On the remote Mac, turn on **System Settings > General > Sharing > Remote Login**.
+2. Make key login work from this Mac, for example with `ssh-copy-id admin@mac-mini`.
+3. Connect one time in a terminal, so that `known_hosts` gets the host key: `ssh admin@mac-mini`.
+4. Test the login. This command must not ask for a password and must not show an error:
+
+   ```sh
+   ssh -o BatchMode=yes admin@mac-mini true
+   ```
+
+5. Add one `remote` line to the config file for each remote folder. The form is `[user@]host[:path]`:
+
+   ```ini
+   # The home folder of admin on the host mac-mini
+   remote = admin@mac-mini
+   # A folder on a Tailscale or LAN address
+   remote = admin@100.64.0.7:/Users/admin/Projects
+   # A Host alias from ~/.ssh/config, and a path in the home folder
+   remote = nas:~/Media
+   ```
+
+   The host can be a name, an IP address (IPv6 in brackets: `[fd7a::1]`), or a `Host` alias from `~/.ssh/config`. The path starts with `/` or `~`. Without a path, the folder is the home folder. `remote = clear` removes all remotes.
+
+The remotes show in the **Remote** group of the sidebar. Click a row, or press `Tab`, move to the row, and press `Enter`. A key can open a remote folder too: `keybind = g>m=remote:admin@mac-mini:/Users/admin`.
+
+### What works
+
+- The list, sort, filter, hidden files, the column header, open a folder, parent, back, and forward.
+- The title and the path bar show `host:/path`. `cmd+r` reads the folder again. The app does not watch a remote folder for changes.
+- `Space` (Quick Look) and `Enter` on a file: the app first copies the file to `~/Library/Caches/com.p1ratedev.better-finder/remote/<host>/<path>`. Then it shows or opens the copy. The copy is read-only: a change to the copy does not go back to the remote host. A large file shows its progress in the status bar. `Escape` stops the copy.
+- The location field (`/`) goes to a path on the same host, for example `..`, `/var/log`, or `~/Downloads`.
+- `copy_path` (`cc`) copies `host:/path`.
+- The first folder opens an SSH connection. The connection stays open for 10 minutes, so the next folders load in one round trip.
+
+When the login needs a password, a passphrase, or a new host key, the app does not wait. The status bar shows the problem and the command to test.
+
+### Limits of this version
+
+- Read-only. Rename, new folder, trash, paste, duplicate, alias, compress, drag and drop, Get Info, Share, Show in Finder, and Open in Terminal do not work in a remote folder. The status bar shows `Not available on a remote folder`. The app never changes a file on the remote host.
+- A package (for example `.app` or `.pages`) does not open. Its context menu item "Show Package Contents" shows its files.
+- The location field shows no matching folders for a remote path, and `Tab` does not complete it.
+- The app does not delete old copies. You can delete the cache folder at any time.
+- The remote host must be macOS, a BSD, or Linux (with GNU `stat`).
 
 ## Default keys
 
@@ -229,12 +280,13 @@ The numbers come from one Apple Silicon Mac, with `BETTER_FINDER_TRACE=1` and `f
 
 Better Finder follows the Ghostty model: a core library and a thin native shell.
 
-- **`bf-core`** is pure Rust, with no UI code: the config parser, the keymap, the directory listing, sort, filter, navigation state, the scroll math, the names of new files, and the drop rules. 182 unit tests cover it.
+- **`bf-core`** is pure Rust, with no UI code: the config parser, the keymap, the directory listing, sort, filter, navigation state, the scroll math, the names of new files, the drop rules, and the scripts and the parser of remote folders. 202 unit tests cover it.
 - **`bf-app`** is the native macOS app, written with AppKit through [`objc2`](https://github.com/madsmtm/objc2):
   - A custom list view draws only the visible rows, so a frame costs the same for 50 files or 100 000.
   - `Space` opens the real `QLPreviewPanel`.
   - The sidebar is a native split view, so it gets the glass look of macOS 26.
   - The app has its own FSEvents streams, which refresh the folder when it changes on disk.
+  - Remote folders use the system `ssh` with a shared connection. A small POSIX shell script lists a folder in one round trip, in a format that is safe for all file names.
 
 The design contracts are in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/UI.md`](docs/UI.md).
 
@@ -242,6 +294,8 @@ The design contracts are in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [
 
 - [ ] Multi-select, and cut and paste (a move) of files
 - [x] Drag and drop to and from other apps
+- [x] Remote folders over SSH (read-only)
+- [ ] Changes in remote folders: upload, rename, and trash
 - [ ] Tabs and split panes
 - [ ] A column view (Miller columns) with a preview column
 - [ ] Date groups (Today, Yesterday, Previous 7 Days) and a Date Added column

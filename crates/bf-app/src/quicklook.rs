@@ -4,6 +4,10 @@
 //! When the panel starts to use it, `begin_control` connects the panel to
 //! the one `QuickLookController` of the app.
 //!
+//! For a remote file, the item is the local copy (`AppState::preview_path`).
+//! Before the copy is ready, the panel has no item. The app shows the panel
+//! (`show`) when the copy is ready.
+//!
 //! Re-entrancy: the panel calls the data source synchronously from
 //! `reloadData`, `makeKeyAndOrderFront:`, and `updateController`. The app
 //! calls these methods only when it holds no borrow of the app state.
@@ -113,9 +117,10 @@ fn controller(mtm: MainThreadMarker) -> Retained<QuickLookController> {
     CONTROLLER.with(|c| c.get_or_init(|| QuickLookController::new(mtm)).clone())
 }
 
-/// The file URL of the entry under the cursor.
+/// The file URL of the entry under the cursor, or of the local copy of a
+/// remote file.
 fn current_url() -> Option<Retained<NSURL>> {
-    let path = app::with_ref(|s| s.pane.current().map(|e| e.path.clone())).flatten()?;
+    let path = app::with_ref(|s| s.preview_path()).flatten()?;
     NSURL::from_file_path(path)
 }
 
@@ -186,6 +191,21 @@ pub fn toggle(mtm: MainThreadMarker) {
     };
     if panel.isVisible() {
         panel.orderOut(None);
+    } else {
+        panel.makeKeyAndOrderFront(None);
+    }
+}
+
+/// Shows the panel. When it is visible, it shows the entry under the
+/// cursor again. Call it only when no borrow of the app state is active.
+pub fn show(mtm: MainThreadMarker) {
+    // SAFETY: `sharedPreviewPanel` has no preconditions on the main thread.
+    let Some(panel) = (unsafe { QLPreviewPanel::sharedPreviewPanel(mtm) }) else {
+        return;
+    };
+    if panel.isVisible() {
+        // SAFETY: The data source is the controller, which is alive.
+        unsafe { panel.reloadData() };
     } else {
         panel.makeKeyAndOrderFront(None);
     }

@@ -1,5 +1,6 @@
 //! Runs `bf_core::fs::read_dir` on a background thread and sends the result
-//! to the main queue.
+//! to the main queue. A request with a host lists a remote folder over SSH
+//! (`remote::list`) on the same thread.
 //!
 //! The first load of the app has a second path: `spawn_first` returns a
 //! handle, and the main thread can take the result before the run loop
@@ -7,6 +8,7 @@
 //! there yet, it goes to the main queue like any other load.
 
 use std::io;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -16,10 +18,14 @@ use dispatch2::DispatchQueue;
 
 use crate::app;
 use crate::file_ops;
+use crate::remote;
 
 /// A finished load.
 pub struct Delivery {
     pub request: LoadRequest,
+    /// The real path of the folder: the request path, or the path that a
+    /// remote host gives for `~`.
+    pub dir: PathBuf,
     pub result: io::Result<Vec<Entry>>,
     /// The time to read and sort.
     pub read_time: Duration,
@@ -54,19 +60,32 @@ fn run_thread(
         .name("bf-loader".into())
         .spawn(move || {
             let started = Instant::now();
-            let mut result = bf_core::fs::read_dir(&thread_request.path);
+            let path = thread_request.path.clone();
+            let (dir, mut result) = match &thread_request.host {
+                Some(host) => match remote::list(host, &path) {
+                    Ok(listing) => (listing.dir, Ok(listing.entries)),
+                    Err(err) => (path, Err(err)),
+                },
+                None => {
+                    let result = bf_core::fs::read_dir(&path);
+                    (path, result)
+                }
+            };
+            let local = thread_request.host.is_none();
             if let Ok(entries) = &mut result {
                 sort_entries(entries, sort);
-                crate::columns::prefetch_kinds(entries);
+                // The kinds come from local files: not for remote entries.
+                if local {
+                    crate::columns::prefetch_kinds(entries);
+                }
             }
             let read_time = started.elapsed();
-            let is_local = result.is_ok() && file_ops::is_local_volume(&thread_request.path);
-            let volume = result
-                .is_ok()
-                .then(|| file_ops::volume_info(&thread_request.path))
-                .flatten();
+            let found = local && result.is_ok();
+            let is_local = found && file_ops::is_local_volume(&dir);
+            let volume = found.then(|| file_ops::volume_info(&dir)).flatten();
             let delivery = Delivery {
                 request: thread_request,
+                dir,
                 result,
                 read_time,
                 is_local,
@@ -88,6 +107,7 @@ fn run_thread(
             .take();
         if let Some(deliver) = deliver {
             deliver(Delivery {
+                dir: request.path.clone(),
                 request,
                 result,
                 read_time: Duration::ZERO,

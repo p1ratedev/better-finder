@@ -46,12 +46,13 @@ This is the Ghostty model: a core library and a thin native shell. The shell con
 | `sort` | Natural sort, sort keys. |
 | `filter` | Live filter (substring or fuzzy, smart case). The test that tells a path from a filter in the location field. |
 | `format` | Size and date text. |
-| `pane` | Navigation state: directory, entries, cursor, history, cursor memory, filter. |
+| `pane` | Navigation state: directory (a `Location`: local, or a path on a remote host), entries, cursor, history, cursor memory, filter. |
 | `viewport` | Scroll arithmetic with the vim rules: half page, page, top, bottom, and the 2-row margin of line moves. Pure functions. |
 | `names` | New names for copies, aliases, and archives, like Finder: `report copy.pdf`, `file 2.txt`, `report.pdf alias`, `report.pdf.zip`. Pure functions. |
 | `transfer` | The rules of a copy, move, or alias into a folder: the name style, the "inside itself" test, and the status text. Pure functions. |
 | `drop` | The Finder rules of a drop: the transfer mode from the offered operations and the volumes, and the checks that stop a drop (a move into the same folder, a folder into itself). Pure functions. |
 | `viewer` | The open requests of other apps: from the paths to one folder and the name to put the cursor on. Pure functions, except `Kind::of`. |
+| `remote` | Remote folders over SSH: the `remote` value (`[user@]host[:path]`), the `ssh` arguments, the control socket and cache paths, the shell scripts with safe quotes, the listing parser, and the error messages. Pure functions. The tests run the scripts through `/bin/sh -s` on this Mac. |
 
 The public API of `bf-core` is the contract with `bf-app`. The doc comments in the source are the specification.
 
@@ -65,7 +66,7 @@ The public API of `bf-core` is the contract with `bf-app`. The doc comments in t
 | `list_view` | A custom `NSView` in an `NSScrollView`. It draws only the dirty rows. It handles keys and the mouse, and gives the context menu (`menuForEvent:`). It is a drag source (a file URL for each dragged row) and a drop target (`bf_core::drop`, then `file_ops::transfer`). It is the controller of the Quick Look panel. During a smooth scroll, a small subview shows the moving cursor highlight. |
 | `columns` | The text of the list columns: size, Kind, and dates. It follows the locale, like Finder. |
 | `header` | The column header above the list. A click on a title sorts the list. |
-| `sidebar` | The sidebar (`NSOutlineView`, source list style) with Favorites and Locations. A background thread builds the model. A volume row has an eject button. |
+| `sidebar` | The sidebar (`NSOutlineView`, source list style) with Favorites, Locations, and Remote. A background thread builds the model. A volume row has an eject button. |
 | `volumes` | The mounted volumes (read on a background thread) and the mount, unmount, and rename notifications. The eject runs on a background thread: `NSWorkspace` ejects the volume, `lsof` finds the apps that keep it busy, and `diskutil` forces the eject. |
 | `toolbar` | The unified toolbar: back, forward, and the location and filter field. The window title shows the path. |
 | `status_bar` | One line at the bottom. It draws the path bar (crumbs), and the counts, free space, filter, pending keys, and messages. |
@@ -80,7 +81,8 @@ The public API of `bf-core` is the contract with `bf-app`. The doc comments in t
 | `editor` | Opens a text file in the `editor` command, in a new window of Ghostty or Terminal. It runs `osascript`. The effect is `OpenFile`; a background thread checks for text. |
 | `icons` | File icons from `NSWorkspace`, with a cache. Each icon renders one time into a bitmap at the draw size. |
 | `theme` | `Rgba` to `NSColor`, fonts, row metrics. |
-| `loader` | Runs `bf_core::fs::read_dir` on a background thread. Sends the result to the main queue. |
+| `loader` | Runs `bf_core::fs::read_dir` (or `remote::list` for a remote folder) on a background thread. Sends the result to the main queue. |
+| `remote` | The SSH transport: runs `/usr/bin/ssh` with a script on its standard input, lists a remote folder, and copies a remote file to the cache (with progress and cancel). Blocking functions for background threads. |
 | `watcher` | Watches the current directory and the config files. Debounces the events. |
 | `debug` | Developer tools: timing traces, `--debug-keys`, and `--debug-screenshot`. |
 
@@ -111,6 +113,21 @@ When the help overlay is open, it has the keyboard focus. `app::help_key` sends 
 2. `loader` runs `read_dir` on a background thread.
 3. The result goes back to the main queue with `dispatch2`. `Pane::finish_load` applies it, or ignores it when the generation is old.
 4. The status bar shows `Loading…` only when a load takes more than 100 ms.
+
+### Remote folder load
+
+1. A sidebar row, a crumb, or a key gives the action `remote:<[user@]host[:path]>`. `Pane::navigate_remote` returns a `LoadRequest` with the host. Open a folder, parent, refresh, back, and forward keep the host of their folder.
+2. The loader thread runs `remote::list`: `ssh ... -- <host> /bin/sh -s` with `bf_core::remote::list_script` on the standard input. A shared connection (`ControlMaster`, `ControlPersist=10m`) makes the next loads one round trip.
+3. `bf_core::remote::parse_listing` makes the `Entry` list and gives the real path of the folder (`~` resolves on the host).
+4. `Pane::finish_load_at` applies it like a local load. The watcher stops: a remote folder has no FSEvents stream.
+5. A failure (no key login, unknown host key, no answer, no such folder) keeps the old folder and shows a short message. `BatchMode` makes sure that `ssh` never waits for a prompt.
+
+### Remote file copy
+
+1. `open` or `quick_look` on a remote file starts a `bf-fetch` thread (`remote::spawn_fetch`). A copy from this run, or a cached copy with the same size and time, serves at once.
+2. `ssh` runs `cat` on the host. The thread writes the bytes to a hidden temporary file in the cache, then renames it. The copy is read-only and has the time of the remote file.
+3. The main queue gets the progress (after 250 ms, at most 4 times each second) and the result. `cancel` stops the copy and sends `SIGTERM` to `ssh`.
+4. The result opens the copy with the normal open rules, or shows it in Quick Look when its entry is still under the cursor. The Quick Look data source reads the copy from the app state, without disk access.
 
 ### Quick Look
 
@@ -167,6 +184,16 @@ Limits:
 - Less objc2 code: there is no table data source, no cell views, and no row views.
 - Cost: no accessibility yet. It is on the roadmap.
 
+### The system ssh, not an SSH library
+
+Remote folders run `/usr/bin/ssh` as a child process.
+
+- The user config (`~/.ssh/config`, aliases, `ProxyJump`), the keys, the SSH agent, and `known_hosts` work with no extra code.
+- No SSH or SFTP crate and no async runtime: the binary stays small and the start stays fast.
+- A shared connection (`ControlMaster`) makes a folder load one round trip, near the speed of an SFTP session.
+- A POSIX shell script on the host lists a folder in one call (BSD or GNU `stat`), with NUL between the fields. It works with any login shell, because only `/bin/sh -s` goes through it.
+- Cost: the host needs `/bin/sh` and `stat` (macOS, the BSDs, and Linux have them), and errors come as text, so `bf_core::remote::error_text` reads the text of `ssh`.
+
 ### std::fs first, getattrlistbulk later
 
 `read_dir` and one `lstat` for each entry are fast on APFS. Finder uses `getattrlistbulk(2)`, which gets names and attributes in batches. It is the next step when a benchmark shows that `lstat` is the bottleneck.
@@ -182,3 +209,4 @@ Limits:
 - Accessibility (`NSAccessibility` for the list view).
 - Fuzzy jump to a directory (zoxide style).
 - Key bindings for non-Latin keyboard layouts (translate the key code with `UCKeyTranslate` and an ASCII-capable layout).
+- Changes in remote folders (upload, rename, trash), and matches of remote paths in the location field.

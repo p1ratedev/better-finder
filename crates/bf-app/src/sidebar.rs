@@ -1,7 +1,9 @@
 //! The sidebar: an `NSOutlineView` with the source list style, like Finder.
 //!
-//! - Two groups: Favorites (from the `sidebar-item` keys) and Locations
-//!   (iCloud Drive, the mounted volumes, the Trash).
+//! - Three groups: Favorites (from the `sidebar-item` keys), Locations
+//!   (iCloud Drive, the mounted volumes, the Trash), and Remote (from the
+//!   `remote` keys: folders on other hosts over SSH). A group without rows
+//!   does not show.
 //! - A background thread builds the model: existence checks, display names,
 //!   and the volume list access the disk. The main thread only shows it.
 //! - The row of the current folder is selected. A click opens the row.
@@ -33,17 +35,27 @@ use objc2_foundation::{
     NSRect, NSSize, NSString,
 };
 
-use bf_core::KeyEvent;
 use bf_core::keymap::{Key, NamedKey};
+use bf_core::remote::Remote;
+use bf_core::{KeyEvent, Location};
 
 use crate::app;
 use crate::debug::trace;
 use crate::list_view;
 
-/// One folder row.
+/// What a row opens.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Target {
+    /// A local folder.
+    Folder(PathBuf),
+    /// The start folder of a remote host.
+    Remote(Remote),
+}
+
+/// One row.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row {
-    pub path: PathBuf,
+    pub target: Target,
     pub name: String,
     /// The SF Symbol name.
     pub symbol: &'static str,
@@ -51,12 +63,16 @@ pub struct Row {
     pub eject: bool,
 }
 
-/// The rows of the two groups.
+/// The rows of the groups.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Model {
     pub favorites: Vec<Row>,
     pub locations: Vec<Row>,
+    pub remotes: Vec<Row>,
 }
+
+/// The group titles, in the order of the groups.
+const GROUPS: [&str; 3] = ["Favorites", "Locations", "Remote"];
 
 /// The SF Symbol for a favorite folder, like Finder.
 fn symbol_for(path: &Path, home: &Path) -> &'static str {
@@ -80,15 +96,35 @@ fn symbol_for(path: &Path, home: &Path) -> &'static str {
     "folder"
 }
 
+/// The sidebar part of the config.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Items {
+    pub favorites: Vec<PathBuf>,
+    pub locations: bool,
+    pub remotes: Vec<Remote>,
+}
+
+impl Items {
+    pub fn of(config: &bf_core::Config) -> Items {
+        Items {
+            favorites: config.sidebar_items.clone(),
+            locations: config.sidebar_locations,
+            remotes: config.remotes.clone(),
+        }
+    }
+}
+
 /// Builds the model. It accesses the disk: call it on a background thread.
-pub fn build_model(items: &[PathBuf], locations: bool) -> Model {
+/// The remote rows need no disk access and no network.
+pub fn build_model(items: &Items) -> Model {
+    let (favorites, locations) = (&items.favorites, items.locations);
     let manager = NSFileManager::defaultManager();
     let home = bf_core::fs::home_dir();
-    let favorites = items
+    let favorites = favorites
         .iter()
         .filter(|path| path.is_dir())
         .map(|path| Row {
-            path: path.clone(),
+            target: Target::Folder(path.clone()),
             name: manager
                 .displayNameAtPath(&NSString::from_str(&path.to_string_lossy()))
                 .to_string(),
@@ -96,9 +132,20 @@ pub fn build_model(items: &[PathBuf], locations: bool) -> Model {
             eject: false,
         })
         .collect();
+    let remotes = items
+        .remotes
+        .iter()
+        .map(|remote| Row {
+            target: Target::Remote(remote.clone()),
+            name: remote.to_string(),
+            symbol: "network",
+            eject: false,
+        })
+        .collect();
     let mut model = Model {
         favorites,
         locations: Vec::new(),
+        remotes,
     };
     if !locations {
         return model;
@@ -106,7 +153,7 @@ pub fn build_model(items: &[PathBuf], locations: bool) -> Model {
     let icloud = home.join("Library/Mobile Documents/com~apple~CloudDocs");
     if icloud.is_dir() {
         model.locations.push(Row {
-            path: icloud,
+            target: Target::Folder(icloud),
             name: "iCloud Drive".to_string(),
             symbol: "icloud",
             eject: false,
@@ -116,14 +163,14 @@ pub fn build_model(items: &[PathBuf], locations: bool) -> Model {
         .locations
         .extend(crate::volumes::list().into_iter().map(|v| Row {
             eject: v.ejectable(),
-            path: v.path,
+            target: Target::Folder(v.path),
             name: v.name,
             symbol: v.symbol,
         }));
     let trash = home.join(".Trash");
     if trash.is_dir() {
         model.locations.push(Row {
-            path: trash,
+            target: Target::Folder(trash),
             name: "Trash".to_string(),
             symbol: "trash",
             eject: false,
@@ -374,8 +421,8 @@ pub fn handle_key(event: &KeyEvent) -> bool {
     }
     if named(NamedKey::Enter) || named(NamedKey::Right) || plain_char('l') {
         let row = outline.selectedRow();
-        if let Some(path) = with_controller(|c| c.path_at_row(&outline, row)).flatten() {
-            app::sidebar_open(path);
+        if let Some(target) = with_controller(|c| c.target_at_row(&outline, row)).flatten() {
+            open_target(target);
         }
         return true;
     }
@@ -409,7 +456,7 @@ fn move_selection(outline: &SidebarOutline, step: isize) {
             return;
         }
         let selectable =
-            with_controller(|c| c.path_at_row(outline, row).is_some()).unwrap_or(false);
+            with_controller(|c| c.target_at_row(outline, row).is_some()).unwrap_or(false);
         if selectable {
             let set = NSIndexSet::indexSetWithIndex(row as usize);
             outline.selectRowIndexes_byExtendingSelection(&set, false);
@@ -508,8 +555,8 @@ define_class!(
                 return;
             };
             let row = outline.clickedRow();
-            if let Some(path) = self.path_at_row(outline, row) {
-                app::sidebar_open(path);
+            if let Some(target) = self.target_at_row(outline, row) {
+                open_target(target);
             }
         }
 
@@ -521,10 +568,18 @@ define_class!(
 );
 
 fn group_rows(model: &Model, group: usize) -> &[Row] {
-    if group == 0 {
-        &model.favorites
-    } else {
-        &model.locations
+    match group {
+        0 => &model.favorites,
+        1 => &model.locations,
+        _ => &model.remotes,
+    }
+}
+
+/// Opens the target of a row, and gives the focus back to the list.
+fn open_target(target: Target) {
+    match target {
+        Target::Folder(path) => app::sidebar_open(path),
+        Target::Remote(remote) => app::sidebar_open_remote(remote),
     }
 }
 
@@ -557,7 +612,7 @@ impl SidebarController {
         let mtm = self.mtm();
         match self.item_of(item)? {
             Item::Group(g) => {
-                let title = if g == 0 { "Favorites" } else { "Locations" };
+                let title = GROUPS.get(g).copied().unwrap_or("");
                 let text = NSTextField::labelWithString(&NSString::from_str(title), mtm);
                 // SAFETY: The weight is an immutable static from AppKit.
                 let weight = unsafe { NSFontWeightSemibold };
@@ -586,8 +641,7 @@ impl SidebarController {
 
     /// The groups that have rows.
     fn groups(&self, model: &Model) -> Vec<usize> {
-        [0, 1]
-            .into_iter()
+        (0..GROUPS.len())
             .filter(|g| !group_rows(model, *g).is_empty())
             .collect()
     }
@@ -631,7 +685,8 @@ impl SidebarController {
         }
     }
 
-    fn path_at_row(&self, outline: &NSOutlineView, row: NSInteger) -> Option<PathBuf> {
+    /// What the row opens, or `None` for a group row.
+    fn target_at_row(&self, outline: &NSOutlineView, row: NSInteger) -> Option<Target> {
         if row < 0 {
             return None;
         }
@@ -640,7 +695,15 @@ impl SidebarController {
             return None;
         };
         let model = self.ivars().model.borrow();
-        group_rows(&model, g).get(i).map(|r| r.path.clone())
+        group_rows(&model, g).get(i).map(|r| r.target.clone())
+    }
+
+    /// The local folder of the row, or `None` (a group row or a remote row).
+    fn path_at_row(&self, outline: &NSOutlineView, row: NSInteger) -> Option<PathBuf> {
+        match self.target_at_row(outline, row)? {
+            Target::Folder(path) => Some(path),
+            Target::Remote(_) => None,
+        }
     }
 
     /// Shows a new model. Call it only when no borrow of the app state is
@@ -658,19 +721,27 @@ impl SidebarController {
         }
     }
 
-    /// Selects the row of `path`, or nothing when no row matches.
-    fn select_path(&self, path: &Path) {
+    /// Selects the row of `location`, or nothing when no row matches. A
+    /// local folder needs a row with the same path. A remote folder selects
+    /// a row of its host: the row with the longest absolute start path that
+    /// contains the folder, else the first row of the host.
+    fn select_location(&self, location: &Location) {
         let Some(outline) = self.ivars().outline.get() else {
             return;
         };
         let found = {
             let model = self.ivars().model.borrow();
-            [0, 1].into_iter().find_map(|g| {
-                group_rows(&model, g)
-                    .iter()
-                    .position(|r| r.path == path)
-                    .map(|i| Item::Row(g, i))
-            })
+            match &location.host {
+                None => [0, 1].into_iter().find_map(|g| {
+                    group_rows(&model, g)
+                        .iter()
+                        .position(|r| r.target == Target::Folder(location.path.clone()))
+                        .map(|i| Item::Row(g, i))
+                }),
+                Some(host) => {
+                    remote_row(&model.remotes, host, &location.path).map(|i| Item::Row(2, i))
+                }
+            }
         };
         let row = found.map(|item| {
             let object = self.object_for(item);
@@ -749,17 +820,17 @@ pub struct PendingModel(Arc<Mutex<Option<Model>>>);
 
 /// Builds the model on a thread. The result goes to the main queue
 /// (`apply_model`). `PendingModel::try_take` can take it earlier.
-pub fn spawn_build(items: Vec<PathBuf>, locations: bool) -> PendingModel {
+pub fn spawn_build(items: Items) -> PendingModel {
     let slot: Arc<Mutex<Option<Model>>> = Arc::new(Mutex::new(None));
     let thread_slot = slot.clone();
     let spawned = std::thread::Builder::new()
         .name("bf-sidebar".into())
         .spawn(move || {
             let started = std::time::Instant::now();
-            let model = build_model(&items, locations);
+            let model = build_model(&items);
             trace!(
                 "sidebar: {} rows in {} µs",
-                model.favorites.len() + model.locations.len(),
+                model.favorites.len() + model.locations.len() + model.remotes.len(),
                 started.elapsed().as_micros()
             );
             *thread_slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(model);
@@ -827,7 +898,71 @@ pub fn click_eject_button(name: &str) -> bool {
     true
 }
 
-/// Selects the row of `path`. Call it without a borrow of the app state.
-pub fn select_path(path: &Path) {
-    with_controller(|c| c.select_path(path));
+/// Selects the row of `location`. Call it without a borrow of the app state.
+pub fn select_location(location: &Location) {
+    with_controller(|c| c.select_location(location));
+}
+
+/// The index of the remote row for the folder `path` on `host`. See
+/// `SidebarController::select_location`.
+fn remote_row(rows: &[Row], host: &str, path: &Path) -> Option<usize> {
+    let best = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, row)| {
+            let start = start_on(row, host)?;
+            (start.starts_with('/') && path.starts_with(start)).then_some((i, start.len()))
+        })
+        .max_by_key(|(_, len)| *len)
+        .map(|(i, _)| i);
+    best.or_else(|| rows.iter().position(|row| start_on(row, host).is_some()))
+}
+
+/// The start path of a remote row of `host`, or `None` for other rows.
+fn start_on<'a>(row: &'a Row, host: &str) -> Option<&'a str> {
+    match &row.target {
+        Target::Remote(remote) if remote.destination == host => Some(remote.path.as_str()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(text: &str) -> Row {
+        let remote = Remote::parse(text).unwrap();
+        Row {
+            name: remote.to_string(),
+            target: Target::Remote(remote),
+            symbol: "network",
+            eject: false,
+        }
+    }
+
+    #[test]
+    fn remote_row_prefers_the_longest_start_path() {
+        let rows = [
+            Row {
+                target: Target::Folder(PathBuf::from("/Volumes/Data")),
+                name: "Data".into(),
+                symbol: "externaldrive",
+                eject: true,
+            },
+            row("mini"),
+            row("mini:/Volumes/Data"),
+            row("me@other:/srv"),
+        ];
+        let find = |host: &str, path: &str| remote_row(&rows, host, Path::new(path));
+        assert_eq!(find("mini", "/Volumes/Data/x"), Some(2));
+        assert_eq!(find("mini", "/Volumes/Data"), Some(2));
+        assert_eq!(
+            find("mini", "/Volumes/DataX"),
+            Some(1),
+            "a prefix must end at a /"
+        );
+        assert_eq!(find("mini", "/Users/admin"), Some(1));
+        assert_eq!(find("me@other", "/"), Some(3));
+        assert_eq!(find("other", "/srv"), None, "the user is part of the host");
+    }
 }
