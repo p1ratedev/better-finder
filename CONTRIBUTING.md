@@ -49,6 +49,20 @@ BETTER_FINDER_TRACE=1 target/release/better-finder ~/Downloads
 
 For tests with disks, use disk images: `hdiutil create -size 20m -fs APFS -volname Test /tmp/test.dmg`, then `hdiutil attach /tmp/test.dmg`.
 
+For tests of remote folders without a network, `BETTER_FINDER_SSH` replaces `/usr/bin/ssh`. This script skips the options of `ssh` and runs the command on this Mac:
+
+```sh
+#!/bin/sh
+# fake-ssh: a "remote host" on this Mac, for UI tests.
+while [ $# -gt 0 ]; do
+  case $1 in --) shift; break ;; -o) shift 2 ;; -*) shift ;; *) break ;; esac
+done
+shift  # the destination
+exec "$@"
+```
+
+Then add `remote = demo:/tmp/demo` to a test config (`XDG_CONFIG_HOME`), and run the app with `BETTER_FINDER_SSH=/path/to/fake-ssh`. Use a test folder, not your real files, for screenshots.
+
 ## Pull requests
 
 1. Open an issue first for a large change, so that we can agree on the design.

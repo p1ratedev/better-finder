@@ -84,13 +84,14 @@ Column text:
 
 ## Sidebar
 
-- `NSOutlineView` with the source list style. Two group rows: `Favorites` and `Locations`.
+- `NSOutlineView` with the source list style. Three group rows: `Favorites`, `Locations`, and `Remote`. A group without rows does not show.
 - **Favorites** come from the config: `sidebar-item = <path>`. The key can occur many times. `sidebar-item = clear` removes the defaults. Defaults: `/Applications`, `~/Desktop`, `~/Documents`, `~/Downloads`, `~`. A path that does not exist does not show.
 - The label is the display name from `NSFileManager displayNameAtPath:` (localized, so `~` shows the user name).
 - **Locations** (`sidebar-locations = true`): iCloud Drive (when `~/Library/Mobile Documents/com~apple~CloudDocs` exists), the mounted volumes that are not hidden (the boot volume first), and the Trash (`~/.Trash`). The list updates when a volume mounts or unmounts (`NSWorkspace` notifications). Get the volume list on a background thread.
+- **Remote** comes from the config: `remote = [user@]host[:path]`. The key can occur many times. `remote = clear` removes all remotes. No `remote` key gives no Remote group. The label is the config value (`admin@mac-mini:/Users/admin`), with the SF Symbol `network`. The rows need no disk access and no network. See "Remote folders".
 - **Icons**: SF Symbols, template style, like Finder. `house` (home), `menubar.dock.rectangle` (Desktop), `doc` (Documents), `arrow.down.circle` (Downloads), `app.dashed` or the nearest Finder match (Applications), `film`, `music.note`, `photo`, `icloud`, `internaldrive`, `externaldrive`, `trash`, `folder` (other folders).
-- The row of the current folder is selected. If no row matches, nothing is selected.
-- A click on a row goes to that folder.
+- The row of the current folder is selected. If no row matches, nothing is selected. In a remote folder, the row of the same host is selected: the row with the longest absolute start path that contains the folder, else the first row of the host.
+- A click on a row goes to that folder. A remote row opens its start folder (the action `remote:<value>`).
 - Keys:
   - `toggle_sidebar` (default `cmd+ctrl+s`, like Finder) shows or hides the sidebar.
   - `focus_sidebar` (default `tab`) moves the focus to the sidebar, or back to the list.
@@ -112,7 +113,7 @@ Column text:
 ## Path and status bar
 
 - One bar at the bottom of the content, 24 pt, with a top separator line.
-- **Left side:** the path from the volume root as breadcrumbs, for example `Macintosh HD > Users > admin > Downloads`. Each crumb has a small icon (14 pt). When there is no space, the middle crumbs truncate first. A click on a crumb goes to that folder.
+- **Left side:** the path from the volume root as breadcrumbs, for example `Macintosh HD > Users > admin > Downloads`. In a remote folder, the first crumb is the host: `admin@mac-mini > Users > admin`. Each crumb has a small icon (14 pt). When there is no space, the middle crumbs truncate first. A crumb never goes under the message. A click on a crumb goes to that folder, on the same host.
 - **Right side:** `578 items, 6 hidden`, then `123 GB available`. Get the free space with `statfs` on the loader thread. Then the pending keys (accent) and the messages: info messages fade after 3 s, and errors stay until the next action.
 - Config: `path-bar = true`. When it is false, only the status text shows.
 
@@ -368,6 +369,63 @@ The keymap gets no keys while a prompt is open, and `ListView` acts on a key equ
 
 `--debug-keys "@menu:3 @menu:bg"` builds the menu of row 3 (the cursor moves to it) and the menu of the folder, and prints the items to stdout: submenus are indented, `[x]` is a checkmark, `(disabled)` is a disabled item, and `---` is a separator.
 
+## Remote folders
+
+A remote folder is a folder on another computer, read over SSH. The list, the keys, and the sort and filter code are the same as for a local folder.
+
+### Config and action
+
+- `remote = [user@]host[:path]`, repeatable (see "Sidebar"). `bf_core::remote::Remote::parse` reads the value:
+  - `user@` is optional. The host is a name, an IP address, or a `Host` alias from `~/.ssh/config`. An IPv6 address goes in brackets: `admin@[fd7a::1]:/Users`.
+  - The user and the host have only letters, digits, `.`, `_`, and `-` (and `:` and `%` in brackets), and do not start with `-`. So `ssh` never reads them as an option.
+  - The path starts with `/` or `~`. Without a path, the folder is the home folder (`~`). The parser cleans the path (`/a/../b` gives `/b`).
+  - A bad value gives a diagnostic with its line number. The other remotes stay.
+- The action `remote:<value>` opens a folder on a host. The sidebar rows and the crumbs use it, and a key can bind to it: `keybind = g>m=remote:admin@mac-mini:/Users/admin`. The parser checks the value when the config loads.
+
+### Transport
+
+- The app runs `/usr/bin/ssh` (the system OpenSSH). It adds no SSH library and no async runtime. The user config, the keys, the agent, and `known_hosts` apply.
+- `ssh -T -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=2 ... -- <destination> /bin/sh -s`. `BatchMode` makes a login that needs a prompt (a password, a passphrase, an unknown host key) fail at once. The app never waits for input.
+- A shared connection: `ControlMaster=auto`, `ControlPersist=10m`, and `ControlPath=$TMPDIR/bf-ssh-<uid>/<hash>`. The first command opens the connection. The commands of the next 10 minutes use it, so a folder loads in one round trip. The hash is 16 hex digits of the destination, because macOS limits a socket path to 104 bytes and `ssh` adds 17 characters while it makes a socket. The app makes the folder with mode 0700 and uses it only when it is private. Else each command opens its own connection.
+- The connection only runs the script: `ClearAllForwardings=yes`, `ForwardAgent=no`, `ForwardX11=no`, `PermitLocalCommand=no`, and `RemoteCommand=none`.
+- The app writes a script to the standard input of `ssh`. Only the words `/bin/sh -s` go through the login shell of the remote user (zsh, bash, fish). The script runs in a POSIX shell. The path goes in single quotes (`'it'\''s'`), and `~` becomes `"$HOME"`.
+- The error output of `ssh` goes to a file without a name, not to a pipe: the shared connection runs on in the background and can keep the error output open.
+- All `ssh` work runs on background threads: the loader thread for a listing, a `bf-fetch` thread for a copy.
+
+### Listing
+
+- One script lists a folder: `cd` to the folder, then the real path (`$PWD`), then one record for each entry, then the names of the symlinks to folders.
+- macOS and the BSDs use BSD `stat -f`. Linux uses GNU `stat --printf`. The script reads `uname -s` to choose. On macOS, the script uses `/usr/bin/stat`, so a GNU `stat` in the `PATH` does no harm.
+- Each field ends with NUL, and an empty field ends a section. A name can hold any byte except NUL and `/`, so the format is safe for all file names. A marker comes first: text that a login file prints (for example an `echo` in `.zshenv`) comes before the marker, and the parser ignores it. The word `end` comes last: a cut output gives an error, not a short list.
+- The parser (`bf_core::remote::parse_listing`) makes the same `Entry` values as `fs::read_dir`: the kind and the execute bit from the mode, the size, the modification and birth times, hidden (a name with a first `.`, or the BSD `UF_HIDDEN` flag), packages, and symlinks to folders. A record with a bad name (`/`, `.`, `..`) does not go in the list.
+- The exit code of the script tells the problem: no such folder, permission denied, or not a folder. Exit code 255 is an error of `ssh` itself. `bf_core::remote::error_text` makes a short message from the error output: SSH key login failed (with the command to test), unknown or changed host key, unknown host, no answer, connection refused (is Remote Login on?), not reachable, or connection closed.
+- The pane stays in the old folder when a load fails, and the status bar shows `Cannot open admin@mac-mini:~: <problem>`.
+
+### The folder in the list
+
+- `Pane` keeps a `Location` (an optional host and a path). Open a folder, parent, refresh, and the history keep the host. `goto:<path>` and the Favorites always go to a local folder. The history can mix hosts.
+- The title is `host:/path`. The window has no proxy icon. The status bar shows no free space.
+- There is no FSEvents stream for a remote folder. `refresh` (`cmd+r`) reads it again.
+- Icons and Kind come from the extension only (no path icons).
+- The location field and the Go to Folder panel go to a path on the same host: an absolute path, a path relative to the folder, `~`, or `~/x`. They show no matching folders and `Tab` does not complete in this version.
+
+### Files
+
+- `quick_look` and `open` on a remote file copy it first: `ssh` runs `cat` on the host (after the marker), and the data goes to a hidden temporary file in `~/Library/Caches/com.p1ratedev.better-finder/remote/<host>/<path>`. A rename puts the copy in place. The copy has mode 0444 (read-only) and the modification time of the remote file.
+- A copy with the same size and time serves again without a download (regular files only; a symlink copies again).
+- After the copy, Quick Look shows it when its entry is still under the cursor, and `open` opens it with the normal rules (the default app, or the `editor` for a text file). The status bar says `Opened a read-only copy of "<name>"`.
+- When Quick Look is visible and the cursor moves to a remote file, the copy starts. A new preview copy stops the old preview copy.
+- After 250 ms, the status bar shows the progress: `Downloading "<name>"… 45%`. `cancel` (`Escape`) stops all copies, and `ssh` gets `SIGTERM`. A stopped copy leaves no file. A temporary file of an app that quit during a copy goes away with the next copy of the same file.
+- A package (`.app`, `.pages`) does not open in this version. Its row menu has `Show Package Contents`.
+
+### Actions that are not available
+
+The app never changes a remote file in this version. In a remote folder, these actions do nothing and the status bar shows `Not available on a remote folder`: `rename`, `new_folder`, `trash`, `copy`, `paste`, `duplicate`, `make_alias`, `compress`, `get_info`, `share`, `open_terminal`, and `reveal_in_finder` (`app::local_only`). In the context menu, their items are disabled, and Open With does not show. A drag does not start from a remote row, a drop on a remote folder does nothing, and the Services get no remote entry. `eject` acts only on the selected sidebar row. `copy_path` copies `host:/path`.
+
+### Test without a network
+
+`BETTER_FINDER_SSH=<program>` replaces `/usr/bin/ssh`. A small script that skips the options and runs the command on this Mac (`exec "$@"`) gives a "remote" host for UI tests with `--debug-keys` and `--debug-screenshot`. The unit tests run the real scripts through `/bin/sh -s` on this Mac.
+
 ## Later (not in this round)
 
 - Groups by date (`Today`, `Yesterday`, `Previous 7 Days`), like the Finder `Use Groups` option.
@@ -375,3 +433,4 @@ The keymap gets no keys while a prompt is open, and `ListView` acts on a key equ
 - Image thumbnails as icons (QuickLookThumbnailing, on a background queue, with a cache).
 - Tags in the sidebar.
 - Tags in the context menu (the color dots and Tags…).
+- Remote folders: upload, rename, and trash; matches and completion of remote paths in the location field; packages; a cache limit.
