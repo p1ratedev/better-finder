@@ -643,11 +643,12 @@ impl ListView {
         let width = self.bounds().size.width;
         // The click put the cursor on the row. A reload can change the
         // rows before the drag: then the drag does not start.
+        // A remote entry is not a local file: it does not drag.
         let info = app::with_ref(|s| {
             let entry = s
                 .pane
                 .visible_entry(row)
-                .filter(|_| s.pane.cursor() == row)?;
+                .filter(|_| s.pane.cursor() == row && !s.pane.is_remote())?;
             Some((entry.path.clone(), s.style.layout(width).name_end))
         })
         .flatten();
@@ -746,6 +747,10 @@ impl ListView {
         let h = self.ivars().row_height.get();
         // The toolbar and the column header cover the top of the list.
         let row = (point.y >= self.free_rect().origin.y && h > 0.0).then(|| (point.y / h) as usize);
+        // A drop never writes to a remote folder.
+        if app::with_ref(|s| s.pane.is_remote()) != Some(false) {
+            return None;
+        }
         let (on_row, cwd) = app::with_ref(|s| {
             let on_row = row.and_then(|row| {
                 let e = s.pane.visible_entry(row)?;

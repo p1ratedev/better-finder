@@ -19,6 +19,7 @@ mod list_view;
 mod loader;
 mod prompt;
 mod quicklook;
+mod remote;
 mod sidebar;
 mod smooth;
 mod status_bar;
@@ -66,6 +67,8 @@ Environment:
   BETTER_FINDER_SCREENCAPTURE=own    The screenshot shows the real window (glass too).
                                      The value 1 uses screencapture (needs the permission)
   XDG_CONFIG_HOME                    The config is $XDG_CONFIG_HOME/better-finder/config
+  BETTER_FINDER_SSH=<program>        Use this program for remote folders, not /usr/bin/ssh
+                                     (for tests without a network)
 ";
 
 enum Command {

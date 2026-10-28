@@ -22,6 +22,16 @@
 //! - Filter change: the cursor stays on the same name when it still matches.
 //!   If not, the cursor goes to the first visible entry.
 //! - A directory change clears the filter.
+//!
+//! # Remote folders
+//!
+//! A folder can be on a remote host (`Location::host`). The pane does not
+//! care how the UI reads it. A load request has the host, and the
+//! navigation keeps it: `open_current`, `parent`, and `refresh` stay on the
+//! host of the current folder, and back and forward use the host of the
+//! history entry. `navigate_to` always goes to a local folder. The remote
+//! host can resolve `~` in a request path, so `finish_load_at` takes the
+//! real path of the folder.
 
 use std::collections::HashMap;
 use std::io;
@@ -30,6 +40,44 @@ use std::path::{Path, PathBuf};
 use crate::filter::FilterMode;
 use crate::fs::Entry;
 use crate::sort::SortOptions;
+
+/// A folder: on this Mac, or on a remote host over SSH.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Location {
+    /// The SSH destination (`[user@]host`) of a remote folder. `None` for a
+    /// local folder.
+    pub host: Option<String>,
+    pub path: PathBuf,
+}
+
+impl Location {
+    pub fn local(path: impl Into<PathBuf>) -> Location {
+        Location {
+            host: None,
+            path: path.into(),
+        }
+    }
+
+    pub fn remote(host: impl Into<String>, path: impl Into<PathBuf>) -> Location {
+        Location {
+            host: Some(host.into()),
+            path: path.into(),
+        }
+    }
+
+    pub fn is_remote(&self) -> bool {
+        self.host.is_some()
+    }
+
+    /// The text for titles and messages: `~/x` for a local folder, and
+    /// `host:/x` for a remote folder.
+    pub fn display(&self) -> String {
+        match &self.host {
+            Some(host) => crate::remote::display(host, &self.path),
+            None => crate::fs::display_path(&self.path),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadKind {
@@ -46,9 +94,21 @@ pub enum LoadKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadRequest {
+    /// The folder to read. A remote path can be `~` or `~/x`.
     pub path: PathBuf,
+    /// The SSH destination for a remote folder, else `None`.
+    pub host: Option<String>,
     pub kind: LoadKind,
     pub generation: u64,
+}
+
+impl LoadRequest {
+    pub fn location(&self) -> Location {
+        Location {
+            host: self.host.clone(),
+            path: self.path.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +132,8 @@ pub struct PaneOptions {
 pub struct Pane {
     /// The directory on screen. Before the first load succeeds, the start directory.
     cwd: PathBuf,
+    /// The SSH destination when `cwd` is on a remote host.
+    host: Option<String>,
     /// All entries of `cwd`, sorted, hidden entries included.
     entries: Vec<Entry>,
     /// Indices into `entries` after the hidden rule and the filter.
@@ -80,10 +142,10 @@ pub struct Pane {
     cursor: usize,
     options: PaneOptions,
     filter: String,
-    back: Vec<PathBuf>,
-    forward: Vec<PathBuf>,
+    back: Vec<Location>,
+    forward: Vec<Location>,
     /// Directory to the name under the cursor when the pane left it.
-    cursor_memory: HashMap<PathBuf, String>,
+    cursor_memory: HashMap<Location, String>,
     /// The request that is in progress, if any.
     pending: Option<LoadRequest>,
     /// Name to put the cursor on when the pending parent load completes.
@@ -98,11 +160,13 @@ impl Pane {
     pub fn new(start: PathBuf, options: PaneOptions) -> (Pane, LoadRequest) {
         let request = LoadRequest {
             path: start.clone(),
+            host: None,
             kind: LoadKind::Navigate,
             generation: 1,
         };
         let pane = Pane {
             cwd: start,
+            host: None,
             entries: Vec::new(),
             visible: Vec::new(),
             cursor: 0,
@@ -120,8 +184,32 @@ impl Pane {
         (pane, request)
     }
 
+    /// The path of the directory on screen. For a remote folder, it is a
+    /// path on the remote host: see `host`.
     pub fn cwd(&self) -> &Path {
         &self.cwd
+    }
+
+    /// The SSH destination when the directory is on a remote host.
+    pub fn host(&self) -> Option<&str> {
+        self.host.as_deref()
+    }
+
+    pub fn is_remote(&self) -> bool {
+        self.host.is_some()
+    }
+
+    /// The directory on screen with its host.
+    pub fn location(&self) -> Location {
+        Location {
+            host: self.host.clone(),
+            path: self.cwd.clone(),
+        }
+    }
+
+    /// The directory on screen when it is a local folder, else `None`.
+    pub fn local_cwd(&self) -> Option<&Path> {
+        self.host.is_none().then_some(self.cwd.as_path())
     }
 
     /// True after the first load succeeded.
@@ -208,19 +296,35 @@ impl Pane {
 
     // ---- Navigation ----
 
-    /// A load of `path` (already absolute and normalized).
+    /// A load of the local folder `path` (already absolute and normalized).
     pub fn navigate_to(&mut self, path: PathBuf) -> LoadRequest {
-        self.request(path, LoadKind::Navigate)
+        self.navigate(Location::local(path))
     }
 
-    /// See `OpenOutcome`.
+    /// A load of the folder `path` on the remote host `host`. The path is
+    /// absolute and normalized, or `~` or `~/x`.
+    pub fn navigate_remote(&mut self, host: String, path: PathBuf) -> LoadRequest {
+        self.navigate(Location::remote(host, path))
+    }
+
+    /// A load of `location`.
+    pub fn navigate(&mut self, location: Location) -> LoadRequest {
+        self.request(location, LoadKind::Navigate)
+    }
+
+    /// See `OpenOutcome`. A folder on a remote host loads from the same
+    /// host. For a remote file, `OpenFile` has the remote path.
     pub fn open_current(&mut self) -> OpenOutcome {
         let Some(entry) = self.current() else {
             return OpenOutcome::Nothing;
         };
         let (is_dir, path) = (entry.is_dir, entry.path.clone());
         if is_dir {
-            OpenOutcome::Navigate(self.navigate_to(path))
+            let location = Location {
+                host: self.host.clone(),
+                path,
+            };
+            OpenOutcome::Navigate(self.navigate(location))
         } else {
             OpenOutcome::OpenFile(path)
         }
@@ -233,7 +337,11 @@ impl Pane {
             .cwd
             .file_name()
             .map(|n| n.to_string_lossy().into_owned());
-        let request = self.request(parent, LoadKind::Parent);
+        let location = Location {
+            host: self.host.clone(),
+            path: parent,
+        };
+        let request = self.request(location, LoadKind::Parent);
         self.pending_child = child;
         Some(request)
     }
@@ -248,16 +356,17 @@ impl Pane {
         !self.forward.is_empty()
     }
 
-    /// Removes the back and forward entries in `prefix` (the folder itself
-    /// and all folders in it), for example the folders of an ejected volume.
-    /// Then it removes the entries that are the same as the next entry or
-    /// as the current directory. So back and forward always change the
-    /// directory.
+    /// Removes the back and forward entries in the local folder `prefix`
+    /// (the folder itself and all folders in it), for example the folders
+    /// of an ejected volume. Remote folders stay. Then it removes the
+    /// entries that are the same as the next entry or as the current
+    /// directory. So back and forward always change the directory.
     pub fn forget_history_under(&mut self, prefix: &Path) {
+        let current = self.location();
         for stack in [&mut self.back, &mut self.forward] {
-            stack.retain(|path| !path.starts_with(prefix));
+            stack.retain(|location| location.is_remote() || !location.path.starts_with(prefix));
             stack.dedup();
-            while stack.last() == Some(&self.cwd) {
+            while stack.last() == Some(&current) {
                 stack.pop();
             }
         }
@@ -265,25 +374,37 @@ impl Pane {
 
     /// `None` when the back stack is empty.
     pub fn back(&mut self) -> Option<LoadRequest> {
-        let path = self.back.last()?.clone();
-        Some(self.request(path, LoadKind::Back))
+        let location = self.back.last()?.clone();
+        Some(self.request(location, LoadKind::Back))
     }
 
     /// `None` when the forward stack is empty.
     pub fn forward(&mut self) -> Option<LoadRequest> {
-        let path = self.forward.last()?.clone();
-        Some(self.request(path, LoadKind::Forward))
+        let location = self.forward.last()?.clone();
+        Some(self.request(location, LoadKind::Forward))
     }
 
     pub fn refresh(&mut self) -> LoadRequest {
-        let path = self.cwd.clone();
-        self.request(path, LoadKind::Refresh)
+        let location = self.location();
+        self.request(location, LoadKind::Refresh)
     }
 
-    /// Applies a load result. Returns false and changes nothing when
-    /// `request` is not the pending request (an old generation). On `Err`,
-    /// sets `error()` and keeps the current directory and entries.
+    /// Applies a load result of the folder `request.path`. See `finish_load_at`.
     pub fn finish_load(&mut self, request: &LoadRequest, result: io::Result<Vec<Entry>>) -> bool {
+        self.finish_load_at(request, request.path.clone(), result)
+    }
+
+    /// Applies a load result. `dir` is the real path of the folder that the
+    /// load read: a remote host resolves `~` (and gives `/Users/admin` for
+    /// `~`). Returns false and changes nothing when `request` is not the
+    /// pending request (an old generation). On `Err`, sets `error()` and
+    /// keeps the current directory and entries.
+    pub fn finish_load_at(
+        &mut self,
+        request: &LoadRequest,
+        dir: PathBuf,
+        result: io::Result<Vec<Entry>>,
+    ) -> bool {
         if self.pending.as_ref() != Some(request) {
             return false;
         }
@@ -292,7 +413,7 @@ impl Pane {
         let mut entries = match result {
             Ok(entries) => entries,
             Err(err) => {
-                let path = crate::fs::display_path(&request.path);
+                let path = request.location().display();
                 self.error = Some(format!("Cannot open {path}: {err}"));
                 return true;
             }
@@ -300,22 +421,27 @@ impl Pane {
         self.error = None;
         crate::sort::sort_entries(&mut entries, self.options.sort);
 
-        let dir_changed = !self.loaded || request.path != self.cwd;
+        let new = Location {
+            host: request.host.clone(),
+            path: dir,
+        };
+        let dir_changed = !self.loaded || new != self.location();
         if dir_changed && self.loaded {
             if let Some(name) = self.current().map(|e| e.name.clone()) {
-                self.cursor_memory.insert(self.cwd.clone(), name);
+                self.cursor_memory.insert(self.location(), name);
             }
         }
-        self.update_history(request);
+        self.update_history(request.kind, &new);
 
         let (old_name, old_index) = (self.current().map(|e| e.name.clone()), self.cursor);
-        self.cwd = request.path.clone();
+        self.cwd = new.path.clone();
+        self.host = new.host.clone();
         self.entries = entries;
         self.loaded = true;
         if dir_changed {
             self.filter.clear();
             self.rebuild_visible();
-            let remembered = self.cursor_memory.get(&self.cwd).cloned();
+            let remembered = self.cursor_memory.get(&new).cloned();
             let target = child
                 .filter(|_| request.kind == LoadKind::Parent)
                 .or(remembered);
@@ -383,10 +509,11 @@ impl Pane {
     // ---- Private helpers ----
 
     /// Starts a new request. It replaces the pending request.
-    fn request(&mut self, path: PathBuf, kind: LoadKind) -> LoadRequest {
+    fn request(&mut self, location: Location, kind: LoadKind) -> LoadRequest {
         self.generation += 1;
         let request = LoadRequest {
-            path,
+            path: location.path,
+            host: location.host,
             kind,
             generation: self.generation,
         };
@@ -395,12 +522,12 @@ impl Pane {
         request
     }
 
-    /// Changes the history stacks after a successful load.
-    fn update_history(&mut self, request: &LoadRequest) {
-        let old = self.cwd.clone();
-        match request.kind {
+    /// Changes the history stacks after a successful load of `new`.
+    fn update_history(&mut self, kind: LoadKind, new: &Location) {
+        let old = self.location();
+        match kind {
             LoadKind::Navigate | LoadKind::Parent => {
-                if self.loaded && request.path != old {
+                if self.loaded && *new != old {
                     self.back.push(old);
                 }
                 self.forward.clear();
@@ -528,6 +655,7 @@ mod tests {
             req,
             LoadRequest {
                 path: "/a".into(),
+                host: None,
                 kind: LoadKind::Navigate,
                 generation: 1
             }
@@ -632,7 +760,7 @@ mod tests {
         let r = pane.navigate_to("/c".into());
         load(&mut pane, &r, &[]);
         assert!(pane.forward().is_none());
-        assert_eq!(pane.back, [PathBuf::from("/a")]);
+        assert_eq!(pane.back, [Location::local("/a")]);
     }
 
     #[test]
@@ -653,7 +781,7 @@ mod tests {
         );
         load(&mut pane, &req, &["a1", "b", "c"]);
         assert_eq!(current_name(&pane), Some("b"));
-        assert_eq!(pane.back, [PathBuf::from("/a/b")]);
+        assert_eq!(pane.back, [Location::local("/a/b")]);
         // Back goes to the child.
         let req = pane.back().unwrap();
         load(&mut pane, &req, &["f"]);
@@ -737,7 +865,7 @@ mod tests {
         let err = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
         assert!(pane.finish_load(&r, Err(err)));
         assert_eq!(pane.cwd(), Path::new("/b"));
-        assert_eq!(pane.back, [PathBuf::from("/a")]);
+        assert_eq!(pane.back, [Location::local("/a")]);
         assert!(pane.forward.is_empty());
         assert!(pane.error().is_some());
         assert!(pane.back().is_some());
@@ -937,5 +1065,116 @@ mod tests {
         assert_eq!(pane.error(), Some("boom"));
         pane.clear_error();
         assert_eq!(pane.error(), None);
+    }
+
+    /// A remote load: the host resolves `~` to `dir`.
+    fn load_remote(pane: &mut Pane, request: &LoadRequest, dir: &str, items: &[&str]) {
+        let entries = listing(items)
+            .into_iter()
+            .map(|mut e| {
+                e.path = Path::new(dir).join(&e.name);
+                e
+            })
+            .collect();
+        assert!(pane.finish_load_at(request, PathBuf::from(dir), Ok(entries)));
+    }
+
+    #[test]
+    fn remote_home_resolves_and_navigation_keeps_the_host() {
+        let mut pane = pane_at("/Users/admin", &["Documents/"]);
+        let req = pane.navigate_remote("admin@mini".into(), "~".into());
+        assert_eq!(req.host.as_deref(), Some("admin@mini"));
+        assert_eq!(req.path, PathBuf::from("~"));
+        load_remote(&mut pane, &req, "/Users/admin", &["Projects/", "notes.txt"]);
+        assert_eq!(pane.host(), Some("admin@mini"));
+        assert_eq!(pane.cwd(), Path::new("/Users/admin"));
+        assert!(pane.is_remote() && pane.local_cwd().is_none());
+        assert_eq!(pane.location().display(), "admin@mini:/Users/admin");
+        // The same path on another host is another folder: history grows.
+        assert_eq!(pane.back, [Location::local("/Users/admin")]);
+
+        // Enter a folder, parent, and refresh stay on the host.
+        let OpenOutcome::Navigate(req) = pane.open_current() else {
+            panic!("expected a folder");
+        };
+        assert_eq!(
+            req.location(),
+            Location::remote("admin@mini", "/Users/admin/Projects")
+        );
+        load_remote(&mut pane, &req, "/Users/admin/Projects", &["src/"]);
+        let req = pane.parent().unwrap();
+        assert_eq!(req.host.as_deref(), Some("admin@mini"));
+        load_remote(&mut pane, &req, "/Users/admin", &["Projects/", "notes.txt"]);
+        assert_eq!(current_name(&pane), Some("Projects"));
+        assert_eq!(pane.refresh().host.as_deref(), Some("admin@mini"));
+
+        // A file opens with its remote path.
+        pane.set_cursor(1);
+        assert_eq!(
+            pane.open_current(),
+            OpenOutcome::OpenFile(PathBuf::from("/Users/admin/notes.txt"))
+        );
+    }
+
+    #[test]
+    fn back_and_forward_cross_hosts() {
+        let mut pane = pane_at("/a", &["x"]);
+        let req = pane.navigate_remote("h".into(), "/a".into());
+        load_remote(&mut pane, &req, "/a", &["remote-x"]);
+        let req = pane.navigate_to("/b".into());
+        load(&mut pane, &req, &[]);
+        assert!(!pane.is_remote());
+        let req = pane.back().unwrap();
+        assert_eq!(req.location(), Location::remote("h", "/a"));
+        load_remote(&mut pane, &req, "/a", &["remote-x"]);
+        let req = pane.back().unwrap();
+        assert_eq!(req.location(), Location::local("/a"));
+        load(&mut pane, &req, &["x"]);
+        let req = pane.forward().unwrap();
+        assert_eq!(req.host.as_deref(), Some("h"));
+    }
+
+    #[test]
+    fn cursor_memory_is_per_host() {
+        let mut pane = pane_at("/d", &["a", "b"]);
+        pane.set_cursor(1);
+        let req = pane.navigate_remote("h".into(), "/d".into());
+        load_remote(&mut pane, &req, "/d", &["a", "b"]);
+        assert_eq!(
+            current_name(&pane),
+            Some("a"),
+            "a new folder starts at the top"
+        );
+        let req = pane.back().unwrap();
+        load(&mut pane, &req, &["a", "b"]);
+        assert_eq!(current_name(&pane), Some("b"));
+    }
+
+    #[test]
+    fn forget_history_keeps_remote_folders() {
+        let mut pane = pane_at("/a", &["x"]);
+        let req = pane.navigate_remote("h".into(), "/Volumes/X".into());
+        load_remote(&mut pane, &req, "/Volumes/X", &[]);
+        visit(&mut pane, "/Volumes/X");
+        visit(&mut pane, "/b");
+        pane.forget_history_under(Path::new("/Volumes/X"));
+        assert_eq!(
+            pane.back,
+            [Location::local("/a"), Location::remote("h", "/Volumes/X")]
+        );
+    }
+
+    #[test]
+    fn remote_error_names_the_host() {
+        let mut pane = pane_at("/a", &["x"]);
+        let req = pane.navigate_remote("admin@mini".into(), "~/nope".into());
+        let err = io::Error::other("no such folder");
+        assert!(pane.finish_load_at(&req, PathBuf::from("~/nope"), Err(err)));
+        assert_eq!(
+            pane.error(),
+            Some("Cannot open admin@mini:~/nope: no such folder")
+        );
+        assert!(!pane.is_remote());
+        assert_eq!(pane.cwd(), Path::new("/a"));
     }
 }

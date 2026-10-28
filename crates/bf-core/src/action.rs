@@ -7,6 +7,7 @@
 use std::fmt;
 use std::str::FromStr;
 
+use crate::remote::Remote;
 use crate::sort::SortKey;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -32,6 +33,10 @@ pub enum Action {
     Goto(String),
     /// Show the "go to folder" prompt.
     GotoPrompt,
+    /// `remote:<host>`: open a folder on a remote host over SSH. The
+    /// parameter has the form of the `remote` config key:
+    /// `[user@]host[:path]`.
+    Remote(Remote),
 
     // View.
     /// Show or hide the macOS Quick Look panel for the entry under the cursor.
@@ -118,6 +123,7 @@ impl Action {
         let name = match self {
             Self::Goto(_) => "goto:<path>".to_string(),
             Self::Sort(_) => "sort:<key>".to_string(),
+            Self::Remote(_) => "remote:<host>".to_string(),
             other => other.to_string(),
         };
         CATALOG
@@ -138,16 +144,16 @@ impl FromStr for Action {
         };
         let err = ParseActionError;
         let simple = match name {
-            "goto" | "sort" => {
+            "goto" | "sort" | "remote" => {
                 let param = param.filter(|p| !p.is_empty()).ok_or_else(|| {
                     err(format!(
                         "{name} needs a parameter, for example {name}:<value>"
                     ))
                 })?;
-                return if name == "goto" {
-                    Ok(Self::Goto(param.to_string()))
-                } else {
-                    param.parse().map(Self::Sort).map_err(err)
+                return match name {
+                    "goto" => Ok(Self::Goto(param.to_string())),
+                    "remote" => Remote::parse(param).map(Self::Remote).map_err(err),
+                    _ => param.parse().map(Self::Sort).map_err(err),
                 };
             }
             "cursor_up" => Self::CursorUp,
@@ -216,6 +222,7 @@ impl fmt::Display for Action {
             Self::Back => "back",
             Self::Forward => "forward",
             Self::Goto(path) => return write!(f, "goto:{path}"),
+            Self::Remote(remote) => return write!(f, "remote:{remote}"),
             Self::GotoPrompt => "goto_prompt",
             Self::QuickLook => "quick_look",
             Self::ToggleHidden => "toggle_hidden",
@@ -269,6 +276,10 @@ static CATALOG: &[(&str, &str)] = &[
     ("forward", "Go to the next directory in the history."),
     ("goto:<path>", "Go to a directory. The path accepts ~."),
     ("goto_prompt", "Show the go to folder prompt."),
+    (
+        "remote:<host>",
+        "Open a folder on a remote host over SSH: [user@]host[:path].",
+    ),
     ("quick_look", "Show or hide the Quick Look panel."),
     ("toggle_hidden", "Show or hide hidden entries."),
     (
@@ -340,6 +351,7 @@ mod tests {
             .map(|(name, _)| match *name {
                 "goto:<path>" => "goto:~/x".parse().unwrap(),
                 "sort:<key>" => "sort:size".parse().unwrap(),
+                "remote:<host>" => "remote:admin@mini:/Users".parse().unwrap(),
                 n => n.parse().unwrap(),
             })
             .collect()
@@ -351,7 +363,7 @@ mod tests {
             assert_eq!(a.to_string().parse::<Action>().unwrap(), a);
             assert!(!a.description().is_empty(), "{a}");
         }
-        assert_eq!(all_actions().len(), 43);
+        assert_eq!(all_actions().len(), 44);
     }
 
     #[test]
@@ -362,6 +374,17 @@ mod tests {
         );
         assert_eq!(" goto : /a:b ".parse(), Ok(Action::Goto("/a:b".into())));
         assert_eq!("sort:size".parse(), Ok(Action::Sort(SortKey::Size)));
+        let remote = Remote::parse("admin@mini:/Users").unwrap();
+        assert_eq!(
+            " remote : admin@mini:/Users ".parse(),
+            Ok(Action::Remote(remote.clone()))
+        );
+        assert_eq!(
+            Action::Remote(remote).to_string(),
+            "remote:admin@mini:/Users"
+        );
+        assert!("remote".parse::<Action>().is_err());
+        assert!("remote:-oProxyCommand=x".parse::<Action>().is_err());
         assert!("goto".parse::<Action>().is_err());
         assert!("goto:".parse::<Action>().is_err());
         assert!("sort".parse::<Action>().is_err());

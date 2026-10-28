@@ -18,6 +18,8 @@
 //!   continues and keeps the previous value of that key.
 //! - `keybind` can occur many times. `keybind = clear` removes all bindings,
 //!   the defaults too. `keybind = x=unbind` removes one binding.
+//! - `sidebar-item` and `remote` can occur many times too. The value `clear`
+//!   removes all items.
 //! - `config-file = <path>` loads one more file. A relative path is relative
 //!   to the directory of the file that has the line. A `?` before the path
 //!   makes the file optional (no diagnostic when it does not exist). Included
@@ -35,6 +37,7 @@ use std::str::FromStr;
 use crate::color::Rgba;
 use crate::filter::FilterMode;
 use crate::keymap::Keymap;
+use crate::remote::Remote;
 use crate::sort::SortOptions;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -292,6 +295,11 @@ pub struct Config {
     pub sidebar_items: Vec<PathBuf>,
     /// `sidebar-locations`: show the Locations group. Default: `true`.
     pub sidebar_locations: bool,
+    /// `remote`, repeatable: one folder on a remote host over SSH, in the
+    /// Remote group of the sidebar: `[user@]host[:path]`. A new remote goes
+    /// after the others. `clear` removes all remotes. An empty value gives
+    /// the default again. Default: none (no Remote group).
+    pub remotes: Vec<Remote>,
     /// `toolbar`: the toolbar with back, forward, the title, and the filter
     /// field. Default: `true`.
     pub toolbar: bool,
@@ -360,6 +368,7 @@ impl Default for Config {
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             sidebar_items: default_sidebar_items(),
             sidebar_locations: true,
+            remotes: Vec::new(),
             toolbar: true,
             column_header: true,
             path_bar: true,
@@ -676,6 +685,16 @@ impl Config {
             }
             "sidebar-locations" => {
                 self.sidebar_locations = if empty { true } else { boolean(key, value)? }
+            }
+            "remote" => {
+                if empty || value == "clear" {
+                    self.remotes.clear();
+                } else {
+                    let remote = Remote::parse(value)?;
+                    if !self.remotes.contains(&remote) {
+                        self.remotes.push(remote);
+                    }
+                }
             }
             "toolbar" => self.toolbar = if empty { true } else { boolean(key, value)? },
             "column-header" => self.column_header = if empty { true } else { boolean(key, value)? },
@@ -1124,6 +1143,18 @@ const TEMPLATE_SECTIONS: &[(&str, &[TemplateKey])] = &[
                 ],
             ),
             tk(
+                "remote",
+                "",
+                &[
+                    "One folder on another Mac or server, over SSH, in the Remote group of the sidebar.",
+                    "The form is [user@]host[:path], for example admin@100.91.36.106 or mac-mini:/Users/admin.",
+                    "The host can be an alias from ~/.ssh/config. The path starts with / or ~.",
+                    "Without a path, the folder is the home folder on the host.",
+                    "SSH key login must work first: ssh -o BatchMode=yes <host> true",
+                    "Use the key one time for each remote. The value clear removes all remotes.",
+                ],
+            ),
+            tk(
                 "toolbar",
                 "true",
                 &["Show the toolbar with back, forward, the title, and the filter field."],
@@ -1485,6 +1516,43 @@ mod tests {
     }
 
     #[test]
+    fn remote_keys() {
+        assert!(Config::default().remotes.is_empty());
+        let c = clean(
+            "remote = admin@100.91.36.106\nremote = mac-mini:/Users/admin\nremote = admin@100.91.36.106\nremote = \"me@[fd7a::1]:~/Projects\"\n",
+        );
+        let texts: Vec<String> = c.remotes.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            texts,
+            [
+                "admin@100.91.36.106",
+                "mac-mini:/Users/admin",
+                "me@[fd7a::1]:~/Projects"
+            ]
+        );
+        assert_eq!(c.remotes[0].destination, "admin@100.91.36.106");
+        assert_eq!(c.remotes[0].path, "~");
+        assert_eq!(c.remotes[1].path, "/Users/admin");
+
+        let c = clean("remote = a\nremote = clear\nremote = b\n");
+        assert_eq!(c.remotes, [Remote::parse("b").unwrap()]);
+        let c = clean("remote = a\nremote =\n");
+        assert!(c.remotes.is_empty());
+
+        // A bad value gives a diagnostic with its line, and the good values stay.
+        let (c, diags) =
+            parse("remote = good\nremote = -oProxyCommand=x\nremote = host:relative\n");
+        assert_eq!(c.remotes, [Remote::parse("good").unwrap()]);
+        assert_eq!(diags.len(), 2);
+        assert_eq!((diags[0].line, diags[1].line), (2, 3));
+        assert!(
+            diags[0].message.contains("invalid remote"),
+            "{}",
+            diags[0].message
+        );
+    }
+
+    #[test]
     fn smooth_scroll_keys() {
         let c = Config::default();
         assert!(c.smooth_scroll);
@@ -1822,6 +1890,7 @@ mod tests {
             "sidebar-width",
             "sidebar-item",
             "sidebar-locations",
+            "remote",
             "toolbar",
             "column-header",
             "path-bar",

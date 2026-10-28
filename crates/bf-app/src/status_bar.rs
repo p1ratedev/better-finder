@@ -19,7 +19,6 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
-use bf_core::Action;
 use objc2::rc::Retained;
 use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{NSBezierPath, NSEvent, NSResponder, NSView};
@@ -77,7 +76,7 @@ define_class!(
                 .find(|(start, end, _)| point.x >= *start && point.x <= *end)
                 .map(|(_, _, path)| path.clone());
             if let Some(path) = target {
-                app::dispatch(Action::Goto(path.to_string_lossy().into_owned()));
+                app::crumb_open(path);
             }
         }
     }
@@ -120,6 +119,13 @@ pub fn crumbs(cwd: &Path, mount: Option<(&Path, &str)>) -> Vec<(String, PathBuf)
         }
     }
     out
+}
+
+/// The name of the first crumb of a remote folder: the host as in the
+/// title (`admin@mini`), without a path.
+fn remote_root_name(host: &str) -> String {
+    let text = bf_core::remote::display(host, Path::new(""));
+    text.strip_suffix(':').unwrap_or(&text).to_string()
 }
 
 /// One status part: text and attributes.
@@ -262,12 +268,16 @@ fn draw_path_bar(s: &AppState, bounds: NSRect, y: f64, line: f64) -> Vec<(f64, f
     }
     let left_end = draw_right(&right, bounds.size.width - END_PAD, limit, y, line);
 
-    // The crumbs.
+    // The crumbs. A remote folder starts with the host.
     let cwd = s.pane.cwd();
-    let mount = s
-        .volume
-        .as_ref()
-        .map(|v| (v.mount.as_path(), v.name.as_str()));
+    let host = s.pane.host().map(remote_root_name);
+    let mount = match &host {
+        Some(name) => Some((Path::new("/"), name.as_str())),
+        None => s
+            .volume
+            .as_ref()
+            .map(|v| (v.mount.as_path(), v.name.as_str())),
+    };
     let crumbs = crumbs(cwd, mount);
     let separator = " \u{203a} ";
     let sep_w = theme::text_width(separator, &st.bar).ceil();
@@ -322,11 +332,9 @@ fn draw_path_bar(s: &AppState, bounds: NSRect, y: f64, line: f64) -> Vec<(f64, f
         }
         x += icon_w;
         if show_text[i] {
-            let width = if i == last {
-                text_w[i].min((left_end - x).max(0.0))
-            } else {
-                text_w[i]
-            };
+            // A long message can leave less space than the text needs:
+            // the text then truncates, and it never goes under the message.
+            let width = text_w[i].min((left_end - x).max(0.0));
             draw_text(
                 name,
                 NSRect::new(NSPoint::new(x, y), NSSize::new(width, line)),
@@ -419,5 +427,19 @@ mod tests {
         assert_eq!(c[1].1, PathBuf::from("/Volumes/X/a"));
         let c = crumbs(Path::new("/tmp"), None);
         assert_eq!(c[0].0, "/");
+    }
+
+    #[test]
+    fn remote_crumbs_start_with_the_host() {
+        assert_eq!(
+            remote_root_name("admin@100.91.36.106"),
+            "admin@100.91.36.106"
+        );
+        assert_eq!(remote_root_name("admin@fd7a::1"), "admin@[fd7a::1]");
+        let root = remote_root_name("mini");
+        let c = crumbs(Path::new("/Users/admin"), Some((Path::new("/"), &root)));
+        let names: Vec<&str> = c.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["mini", "Users", "admin"]);
+        assert_eq!(c[0].1, PathBuf::from("/"));
     }
 }

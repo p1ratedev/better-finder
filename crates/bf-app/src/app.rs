@@ -11,22 +11,25 @@
 //! the AppKit work out of the borrow.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 
 use bf_core::config::{Diagnostic, ThemeMode, default_config_template};
 use bf_core::filter::is_path_query;
 use bf_core::fs::{display_path, expand_path, home_dir};
 use bf_core::keymap::{Key, KeyPress, NamedKey};
 use bf_core::pane::{LoadKind, PaneOptions};
+use bf_core::remote::{self as remote_core, Remote};
 use bf_core::viewer::{self, Kind};
 use bf_core::viewport::{self, Motion, Position, Viewport};
 use bf_core::{
     Action, Config, Entry, EntryKind, KeyEvent, KeyOutcome, Keymap, KeymapState, LoadRequest,
-    LoadResult, OpenOutcome, Pane,
+    LoadResult, Location, OpenOutcome, Pane,
 };
 use dispatch2::{DispatchQueue, DispatchTime};
 use objc2::rc::Retained;
@@ -56,6 +59,7 @@ use crate::list_view::ListView;
 use crate::loader::{self, Delivery};
 use crate::prompt::{self, PromptMode};
 use crate::quicklook;
+use crate::remote::{self, FetchControl, FetchRequest};
 use crate::sidebar;
 use crate::smooth::{self, ListScroll, Target};
 use crate::status_bar::StatusBar;
@@ -137,7 +141,8 @@ impl Message {
 #[derive(Default)]
 struct Rendered {
     valid: bool,
-    cwd: PathBuf,
+    /// The folder on screen, with its host.
+    folder: Option<Location>,
     cursor: usize,
     len: usize,
     current: Option<PathBuf>,
@@ -163,6 +168,43 @@ struct EjectState {
     /// notification shows no `was ejected` message. A volume list that has
     /// this mount point again (a new mount) clears it.
     ejected: Option<PathBuf>,
+}
+
+/// The message for a local-only action in a remote folder.
+const NOT_ON_REMOTE: &str = "Not available on a remote folder";
+
+/// What a copy of a remote file is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FetchUse {
+    /// `open`: open the copy in its default app (or the editor).
+    Open,
+    /// `quick_look`: show the copy in the Quick Look panel.
+    Preview,
+}
+
+/// A copy of a remote file that runs on a background thread.
+struct FetchJob {
+    id: u64,
+    /// The host and the remote path.
+    key: (String, PathBuf),
+    name: String,
+    size: u64,
+    modified: Option<SystemTime>,
+    /// The id of the progress message of the copy, when it shows.
+    message: Option<u64>,
+    /// Open the copy when it is ready.
+    open: bool,
+    /// Show the copy in Quick Look when it is ready (and still under the cursor).
+    preview: bool,
+    control: Arc<FetchControl>,
+}
+
+/// A local copy of a remote file, from this run of the app.
+#[derive(Clone, Debug)]
+struct RemoteCopy {
+    size: u64,
+    modified: Option<SystemTime>,
+    local: PathBuf,
 }
 
 /// All state of the app. Main thread only.
@@ -229,6 +271,12 @@ pub struct AppState {
     /// The target of the action in progress, when it is not the entry
     /// under the cursor: the background menu acts on the current folder.
     target: Option<PathBuf>,
+    /// The copies of remote files that run now.
+    fetches: Vec<FetchJob>,
+    fetch_id: u64,
+    /// The local copies of remote files: (host, remote path) to the copy.
+    /// Quick Look reads it, so it needs no disk access.
+    copies: HashMap<(String, PathBuf), RemoteCopy>,
     /// `NSApplication` keeps only a weak reference to its delegate.
     _delegate: Retained<AppDelegate>,
 }
@@ -592,7 +640,7 @@ pub fn run(options: RunOptions) -> ExitCode {
     // The sidebar model needs disk access too: build it on a thread now.
     let sidebar_start = config
         .sidebar
-        .then(|| sidebar::spawn_build(config.sidebar_items.clone(), config.sidebar_locations));
+        .then(|| sidebar::spawn_build(sidebar::Items::of(&config)));
 
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
@@ -664,6 +712,9 @@ pub fn run(options: RunOptions) -> ExitCode {
         eject: EjectState::default(),
         forget_after_load: Vec::new(),
         target: None,
+        fetches: Vec::new(),
+        fetch_id: 0,
+        copies: HashMap::new(),
         _delegate: delegate.clone(),
     };
     if let Some(text) = start_error.or_else(|| config_problem(&diagnostics, &warnings)) {
@@ -800,6 +851,27 @@ fn config_problem(diagnostics: &[Diagnostic], warnings: &[String]) -> Option<Str
 }
 
 // ---- Keys and actions ----
+
+/// True for the actions that need a local file or folder. In a remote
+/// folder, they do nothing and show `NOT_ON_REMOTE`. The app never changes
+/// a remote file.
+pub fn local_only(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::Rename
+            | Action::NewFolder
+            | Action::Trash
+            | Action::Copy
+            | Action::Paste
+            | Action::Duplicate
+            | Action::MakeAlias
+            | Action::Compress
+            | Action::GetInfo
+            | Action::Share
+            | Action::OpenTerminal
+            | Action::RevealInFinder
+    )
+}
 
 /// True for the actions that a held key (key repeat) can do: cursor moves.
 fn repeat_allowed(action: &Action) -> bool {
@@ -965,6 +1037,8 @@ enum Effect {
     },
     Reveal(PathBuf),
     QuickLookToggle,
+    /// Show the Quick Look panel, or show the new item when it is visible.
+    QuickLookShow,
     QuickLookClose,
     OpenPrompt {
         place: PromptPlace,
@@ -1037,6 +1111,7 @@ fn run_effects(mtm: MainThreadMarker, effects: Vec<Effect>) {
             } => open_text_or_default(path, editor, terminal),
             Effect::Reveal(path) => reveal_in_finder(&path),
             Effect::QuickLookToggle => quicklook::toggle(mtm),
+            Effect::QuickLookShow => quicklook::show(mtm),
             Effect::QuickLookClose => quicklook::close(mtm),
             Effect::OpenPrompt {
                 place,
@@ -1270,20 +1345,39 @@ pub fn sidebar_open(path: PathBuf) {
     dispatch(Action::Goto(path.to_string_lossy().into_owned()));
 }
 
+/// A click on a remote row of the sidebar, or `enter` on it: open the
+/// start folder of the remote and give the focus back to the list.
+pub fn sidebar_open_remote(remote: Remote) {
+    focus_list();
+    dispatch(Action::Remote(remote));
+}
+
+/// A click on a crumb of the path bar: go to that folder, on the host of
+/// the current folder.
+pub fn crumb_open(path: PathBuf) {
+    let host = with_ref(|s| s.pane.host().map(str::to_string)).flatten();
+    let action = match host {
+        Some(destination) => Action::Remote(Remote {
+            destination,
+            path: path.to_string_lossy().into_owned(),
+        }),
+        None => Action::Goto(path.to_string_lossy().into_owned()),
+    };
+    dispatch(action);
+}
+
 /// Selects the sidebar row of the current folder.
 pub fn sync_sidebar_selection() {
-    if let Some(cwd) = with_ref(|s| s.pane.cwd().to_path_buf()) {
-        sidebar::select_path(&cwd);
+    if let Some(location) = with_ref(|s| s.pane.location()) {
+        sidebar::select_location(&location);
     }
 }
 
 /// Builds the sidebar model again (volumes changed, or config reload).
 pub fn rebuild_sidebar() {
-    if let Some((items, locations)) =
-        with_ref(|s| (s.config.sidebar_items.clone(), s.config.sidebar_locations))
-    {
+    if let Some(items) = with_ref(|s| sidebar::Items::of(&s.config)) {
         // `spawn_build` applies the model on the main queue when it is done.
-        let _pending = sidebar::spawn_build(items, locations);
+        let _pending = sidebar::spawn_build(items);
     }
 }
 
@@ -1714,11 +1808,129 @@ impl AppState {
         }
     }
 
+    /// The local copy of a remote entry from this run, when the listing
+    /// still has the same size and time.
+    fn fresh_copy(&self, host: &str, entry: &Entry) -> Option<&RemoteCopy> {
+        let copy = self.copies.get(&(host.to_string(), entry.path.clone()))?;
+        (copy.size == entry.size && copy.modified == entry.modified).then_some(copy)
+    }
+
+    /// The local file for Quick Look: the entry under the cursor, or the
+    /// local copy of a remote file. `None` when no copy is ready. It needs
+    /// no disk access.
+    pub fn preview_path(&self) -> Option<PathBuf> {
+        let entry = self.pane.current()?;
+        match self.pane.host() {
+            None => Some(entry.path.clone()),
+            Some(host) => self.fresh_copy(host, entry).map(|c| c.local.clone()),
+        }
+    }
+
+    /// Opens a local copy of a remote file, and tells that it is a copy.
+    fn open_copy(&mut self, local: PathBuf, name: &str, fx: &mut Vec<Effect>) {
+        fx.push(self.open_file_effect(local));
+        self.set_info(format!("Opened a read-only copy of \"{name}\""));
+    }
+
+    /// Copies the remote file under the cursor to the cache on a background
+    /// thread, then opens it (`Open`) or shows it in Quick Look (`Preview`).
+    /// A copy from this run serves at once. A new preview stops the old
+    /// preview copies that nothing else waits for, so a fast cursor does not
+    /// start many downloads.
+    fn fetch_current(&mut self, use_: FetchUse, fx: &mut Vec<Effect>) {
+        let Some(host) = self.pane.host().map(str::to_string) else {
+            return;
+        };
+        let Some(entry) = self.pane.current().cloned() else {
+            return;
+        };
+        if entry.is_package {
+            self.set_info("A package in a remote folder does not open in this version");
+            return;
+        }
+        if entry.is_dir || entry.kind == EntryKind::Directory {
+            if use_ == FetchUse::Preview {
+                self.set_info("Quick Look shows only files in a remote folder");
+            }
+            return;
+        }
+        if let Some(local) = self.fresh_copy(&host, &entry).map(|c| c.local.clone()) {
+            match use_ {
+                FetchUse::Open => self.open_copy(local, &entry.name, fx),
+                FetchUse::Preview => fx.push(Effect::QuickLookShow),
+            }
+            return;
+        }
+        let key = (host.clone(), entry.path.clone());
+        if use_ == FetchUse::Preview {
+            for job in &mut self.fetches {
+                if job.key != key && job.preview {
+                    job.preview = false;
+                    if !job.open {
+                        job.control.cancel();
+                    }
+                }
+            }
+        }
+        let running = self
+            .fetches
+            .iter_mut()
+            .find(|j| j.key == key && !j.control.is_canceled());
+        if let Some(job) = running {
+            match use_ {
+                FetchUse::Open => job.open = true,
+                FetchUse::Preview => job.preview = true,
+            }
+            return;
+        }
+        self.fetch_id += 1;
+        let id = self.fetch_id;
+        let control = Arc::new(FetchControl::default());
+        let reuse = entry.kind == EntryKind::File;
+        let request = FetchRequest {
+            destination: host,
+            path: entry.path.clone(),
+            size: entry.size,
+            modified: entry.modified,
+            reuse,
+        };
+        match remote::spawn_fetch(id, request, control.clone()) {
+            Ok(()) => self.fetches.push(FetchJob {
+                id,
+                key,
+                name: entry.name,
+                size: entry.size,
+                modified: entry.modified,
+                message: None,
+                open: use_ == FetchUse::Open,
+                preview: use_ == FetchUse::Preview,
+                control,
+            }),
+            Err(err) => self.set_error(format!("Cannot start a thread: {err}")),
+        }
+    }
+
+    /// Stops all copies of remote files. True when a copy ran.
+    fn cancel_fetches(&mut self) -> bool {
+        let mut any = false;
+        for job in &self.fetches {
+            if !job.control.is_canceled() {
+                job.control.cancel();
+                any = true;
+            }
+        }
+        any
+    }
+
     fn perform(&mut self, action: Action, ql_visible: bool) -> Vec<Effect> {
         let mut fx = Vec::new();
         self.reveal_cursor = true;
         if self.message.as_ref().is_some_and(|m| m.error) {
             self.message = None;
+        }
+        if self.pane.is_remote() && local_only(&action) {
+            self.set_info(NOT_ON_REMOTE);
+            return fx;
         }
         match action {
             Action::CursorUp => self.pane.move_cursor(-1),
@@ -1731,6 +1943,9 @@ impl AppState {
             | Action::HalfPageDown => self.page_motion(&action),
             Action::Open => match self.pane.open_current() {
                 OpenOutcome::Navigate(request) => self.start_load(request),
+                OpenOutcome::OpenFile(_) if self.pane.is_remote() => {
+                    self.fetch_current(FetchUse::Open, &mut fx)
+                }
                 OpenOutcome::OpenFile(path) => fx.push(self.open_file_effect(path)),
                 OpenOutcome::Nothing => {}
             },
@@ -1750,15 +1965,33 @@ impl AppState {
                 }
             }
             Action::Goto(text) => {
-                let path = expand_path(&text, self.pane.cwd());
+                // `goto` always goes to a local folder. In a remote folder,
+                // a relative path starts at the home folder.
+                let base = self
+                    .pane
+                    .local_cwd()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(home_dir);
+                let path = expand_path(&text, &base);
                 let request = self.pane.navigate_to(path);
+                self.start_load(request);
+            }
+            Action::Remote(remote) => {
+                let request = self
+                    .pane
+                    .navigate_remote(remote.destination, PathBuf::from(remote.path));
                 self.start_load(request);
             }
             Action::GotoPrompt => {
                 self.open_prompt(PromptMode::Goto, String::new(), (0, 0), ql_visible, &mut fx)
             }
             Action::QuickLook => {
-                if ql_visible || self.pane.current().is_some() {
+                if ql_visible {
+                    fx.push(Effect::QuickLookToggle);
+                } else if self.pane.is_remote() {
+                    // A remote file shows after its copy is ready.
+                    self.fetch_current(FetchUse::Preview, &mut fx);
+                } else if self.pane.current().is_some() {
                     fx.push(Effect::QuickLookToggle);
                 }
             }
@@ -1779,6 +2012,8 @@ impl AppState {
                 } else if !self.pane.filter().is_empty() {
                     self.pane.clear_filter();
                     self.content_dirty = true;
+                } else if self.cancel_fetches() {
+                    self.set_info("Download canceled");
                 } else {
                     self.message = None;
                 }
@@ -1827,9 +2062,16 @@ impl AppState {
             Action::Trash => self.trash(),
             Action::CopyPath => {
                 let path = self.current_or_cwd();
-                let text = path.to_string_lossy().into_owned();
+                // A remote path has its host: `host:/path`.
+                let (text, shown) = match self.pane.host() {
+                    Some(host) => {
+                        let text = remote_core::display(host, &path);
+                        (text.clone(), text)
+                    }
+                    None => (path.to_string_lossy().into_owned(), display_path(&path)),
+                };
                 if copy_to_pasteboard(&text) {
-                    self.set_info(format!("Copied \"{}\"", display_path(&path)));
+                    self.set_info(format!("Copied \"{shown}\""));
                 } else {
                     self.set_error("Cannot copy to the pasteboard");
                 }
@@ -1883,6 +2125,7 @@ impl AppState {
     /// True when the current folder is on the volume at `mount`.
     fn cwd_on(&self, mount: &Path) -> bool {
         mount != Path::new("/")
+            && !self.pane.is_remote()
             && (self.pane.cwd().starts_with(mount)
                 || self.volume.as_ref().is_some_and(|v| v.mount == mount))
     }
@@ -1904,6 +2147,10 @@ impl AppState {
     fn eject_target(&self, sidebar: Option<Option<PathBuf>>) -> Option<Volume> {
         if let Some(row) = sidebar {
             return row.and_then(|path| self.ejectable_volume(&path));
+        }
+        // The entries and the folder of a remote host are not local volumes.
+        if self.pane.is_remote() {
+            return None;
         }
         let under_cursor = self
             .pane
@@ -1990,10 +2237,11 @@ impl AppState {
     fn leave_volume(&mut self, mount: &Path, ql_visible: bool, fx: &mut Vec<Effect>) -> bool {
         let on_volume = self.cwd_on(mount);
         let shows_volume = on_volume
-            || self
-                .pane
-                .current()
-                .is_some_and(|e| e.path.starts_with(mount));
+            || (!self.pane.is_remote()
+                && self
+                    .pane
+                    .current()
+                    .is_some_and(|e| e.path.starts_with(mount)));
         if ql_visible && shows_volume {
             fx.push(Effect::QuickLookClose);
         }
@@ -2136,6 +2384,15 @@ impl AppState {
         let input = text.trim();
         if input.is_empty() {
             self.close_prompt(fx);
+            return;
+        }
+        // In a remote folder, a path goes to a folder on the same host. The
+        // remote listing tells when the folder does not exist.
+        if let Some(host) = self.pane.host().map(str::to_string) {
+            let path = remote_core::resolve_input(input, self.pane.cwd());
+            self.close_path_prompt(fx);
+            let request = self.pane.navigate_remote(host, path);
+            self.start_load(request);
             return;
         }
         let path = expand_path(input, self.pane.cwd());
@@ -2382,6 +2639,95 @@ pub fn transfer_finished(report: TransferReport) {
     new_items_finished(report.changed, &report.dest_dir, first_new, message);
 }
 
+/// Progress of a copy of a remote file (`remote::spawn_fetch`).
+pub fn fetch_progress(id: u64, done: u64, total: u64) {
+    let shown = with(|s| {
+        let job = s
+            .fetches
+            .iter()
+            .find(|j| j.id == id && !j.control.is_canceled())?;
+        let text = if total > 0 && done <= total {
+            format!(
+                "Downloading \"{}\"\u{2026} {}%",
+                job.name,
+                done * 100 / total
+            )
+        } else {
+            format!(
+                "Downloading \"{}\"\u{2026} {}",
+                job.name,
+                columns::byte_count(done)
+            )
+        };
+        s.set_progress(text);
+        let message = s.message_id;
+        if let Some(job) = s.fetches.iter_mut().find(|j| j.id == id) {
+            job.message = Some(message);
+        }
+        Some(())
+    })
+    .flatten();
+    if shown.is_some() {
+        redraw_status();
+    }
+}
+
+/// A copy of a remote file is complete: open it, or show it in Quick Look
+/// when its entry is still under the cursor. A canceled copy shows nothing.
+pub fn fetch_finished(id: u64, result: io::Result<PathBuf>) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let effects = with(|s| {
+        let mut fx = Vec::new();
+        let Some(index) = s.fetches.iter().position(|j| j.id == id) else {
+            return fx;
+        };
+        let job = s.fetches.remove(index);
+        // Remove the progress message of this copy.
+        if job.message.is_some() && s.message.as_ref().map(|m| m.id) == job.message {
+            s.message = None;
+        }
+        match result {
+            Ok(local) => {
+                let copy = RemoteCopy {
+                    size: job.size,
+                    modified: job.modified,
+                    local: local.clone(),
+                };
+                s.copies.insert(job.key.clone(), copy);
+                if job.open {
+                    s.open_copy(local, &job.name, &mut fx);
+                }
+                let current = s.pane.host() == Some(job.key.0.as_str())
+                    && s.pane.current().is_some_and(|e| e.path == job.key.1);
+                if job.preview && current {
+                    fx.push(Effect::QuickLookShow);
+                }
+            }
+            Err(_) if job.control.is_canceled() => {}
+            Err(err) => s.set_error(format!("Cannot download \"{}\": {err}", job.name)),
+        }
+        fx
+    })
+    .unwrap_or_default();
+    run_effects(mtm, effects);
+    sync_ui();
+}
+
+/// Quick Look is visible and the cursor moved to a remote file without a
+/// copy: start the copy. Call it without a borrow of the app state.
+fn preview_current(mtm: MainThreadMarker) {
+    let effects = with(|s| {
+        let mut fx = Vec::new();
+        s.fetch_current(FetchUse::Preview, &mut fx);
+        fx
+    })
+    .unwrap_or_default();
+    run_effects(mtm, effects);
+    redraw_status();
+}
+
 /// A background file operation is complete. Shows `message`. When the
 /// current folder is in `changed`, it reads the folder again, and the
 /// cursor goes to `new_name` in `dir` when the list shows it.
@@ -2395,7 +2741,9 @@ fn new_items_finished(
         if let Some((text, error)) = message {
             s.set_message(text, error);
         }
-        let cwd = s.pane.cwd().to_path_buf();
+        let Some(cwd) = s.pane.local_cwd().map(Path::to_path_buf) else {
+            return;
+        };
         if !changed.contains(&cwd) {
             return;
         }
@@ -2561,6 +2909,7 @@ impl AppState {
 pub fn finish_load(delivery: Delivery) {
     let Delivery {
         request,
+        dir,
         result,
         read_time,
         is_local,
@@ -2570,9 +2919,9 @@ pub fn finish_load(delivery: Delivery) {
     let count = result.as_ref().map(Vec::len).unwrap_or(0);
     let outcome = with(|s| {
         let was_loaded = s.pane.is_loaded();
-        let old_cwd = s.pane.cwd().to_path_buf();
+        let old_location = s.pane.location();
         let old_name = s.pane.current().map(|e| e.name.clone());
-        if !s.pane.finish_load(&request, result) {
+        if !s.pane.finish_load_at(&request, dir, result) {
             return None;
         }
         let was_auto = std::mem::take(&mut s.load_auto);
@@ -2587,7 +2936,8 @@ pub fn finish_load(delivery: Delivery) {
             s.volume = volume;
         }
         let cwd = s.pane.cwd().to_path_buf();
-        let dir_changed = (!was_loaded && s.pane.is_loaded()) || cwd != old_cwd;
+        let location = s.pane.location();
+        let dir_changed = (!was_loaded && s.pane.is_loaded()) || location != old_location;
         if let Some((dir, name)) = s.pending_select.take() {
             let selected = dir == cwd && failed.is_none() && s.pane.select_name(&name);
             // A read that started before the change does not have the new
@@ -2636,15 +2986,19 @@ pub fn finish_load(delivery: Delivery) {
             s.load_auto = auto;
         }
         s.content_dirty = true;
-        Some((cwd, dir_changed, total, fx))
+        Some((location, dir_changed, total, fx))
     });
-    let Some(Some((cwd, dir_changed, total, effects))) = outcome else {
+    let Some(Some((location, dir_changed, total, effects))) = outcome else {
         return;
     };
     watcher::set_last_read(read_time);
     if dir_changed {
         icons::clear_paths();
-        watcher::watch_directory(&cwd);
+        if location.is_remote() {
+            watcher::stop_directory();
+        } else {
+            watcher::watch_directory(&location.path);
+        }
     }
     if let Some(mtm) = MainThreadMarker::new() {
         run_effects(mtm, effects);
@@ -2652,7 +3006,7 @@ pub fn finish_load(delivery: Delivery) {
     sync_ui();
     trace!(
         "load {}: {count} entries in {:.1} ms (read and sort {:.1} ms, main thread {} µs)",
-        display_path(&cwd),
+        location.display(),
         total.unwrap_or(read_time).as_secs_f64() * 1000.0,
         read_time.as_secs_f64() * 1000.0,
         started.elapsed().as_micros(),
@@ -2665,7 +3019,8 @@ pub fn finish_load(delivery: Delivery) {
 /// on disk. A load in progress is not replaced: one refresh waits for it.
 pub fn auto_refresh() {
     with(|s| {
-        if !s.config.auto_refresh || !s.pane.is_loaded() {
+        // A late event of the previous local folder: no refresh of a remote folder.
+        if !s.config.auto_refresh || !s.pane.is_loaded() || s.pane.is_remote() {
             return;
         }
         if s.pane.is_loading() {
@@ -3147,9 +3502,12 @@ fn split_goto_text(text: &str, cwd: &Path) -> (String, String, PathBuf) {
 fn goto_query(text: String) {
     let info = with(|s| {
         s.goto.query += 1;
-        (s.goto.query, s.pane.cwd().to_path_buf())
+        // The matches are local folders: none in a remote folder.
+        s.pane
+            .local_cwd()
+            .map(|cwd| (s.goto.query, cwd.to_path_buf()))
     });
-    let Some((id, cwd)) = info else {
+    let Some(Some((id, cwd))) = info else {
         return;
     };
     let (dir_text, prefix, dir) = split_goto_text(&text, &cwd);
@@ -3209,6 +3567,10 @@ pub fn prompt_complete(text: String) -> bool {
     let Some(Some((cwd, selected))) = info else {
         return false;
     };
+    // No completion of remote paths in this version.
+    if with_ref(|s| s.pane.is_remote()) == Some(true) {
+        return true;
+    }
     // A selected match of the panel completes to that folder.
     if let Some(new_text) = selected {
         if let Some(field) = prompt_field() {
@@ -3327,7 +3689,8 @@ fn apply_config(result: LoadResult) {
     let new_config = config.clone();
     let ui = with(|s| {
         let sidebar_changed = s.config.sidebar_items != config.sidebar_items
-            || s.config.sidebar_locations != config.sidebar_locations;
+            || s.config.sidebar_locations != config.sidebar_locations
+            || s.config.remotes != config.remotes;
         let sidebar_toggled = s.config.sidebar != config.sidebar;
         s.pane.set_show_hidden(config.show_hidden);
         s.pane.set_sort(config.sort);
@@ -3424,7 +3787,7 @@ struct UiPlan {
     header: Retained<HeaderView>,
     redraw_header: bool,
     history: Option<(bool, bool)>,
-    sidebar_path: Option<PathBuf>,
+    sidebar_location: Option<Location>,
     /// The filter text for the toolbar field, when the field does not edit.
     search_text: Option<String>,
     inline: Option<InlinePlan>,
@@ -3446,17 +3809,21 @@ struct UiPlan {
     /// The title, the directory, and true when it is on a local volume.
     title: Option<(String, PathBuf, bool)>,
     quick_look_reload: bool,
+    /// The cursor is on a remote file without a local copy: when Quick
+    /// Look is visible, start the copy.
+    preview_fetch: bool,
 }
 
 impl AppState {
     fn plan_ui(&mut self) -> UiPlan {
         let cwd = self.pane.cwd().to_path_buf();
+        let folder = self.pane.location();
         let cursor = self.pane.cursor();
         let len = self.pane.visible_len();
         let current = self.pane.current().map(|e| e.path.clone());
         let row_height = self.style.row_height;
         let r = &self.rendered;
-        let dir_changed = !r.valid || r.cwd != cwd;
+        let dir_changed = !r.valid || r.folder.as_ref() != Some(&folder);
         let layout_changed = dir_changed || r.len != len || r.row_height != row_height;
         let cursor_changed = r.cursor != cursor;
         let redraw = if self.content_dirty || layout_changed {
@@ -3479,8 +3846,15 @@ impl AppState {
             )
         });
         let location_changed = !r.valid || r.location != location;
-        let title = dir_changed.then(|| (display_path(&cwd), cwd.clone(), self.cwd_is_local));
+        let title = dir_changed.then(|| (folder.display(), cwd.clone(), self.cwd_is_local));
         let quick_look_reload = dir_changed || r.current != current;
+        let preview_fetch = quick_look_reload
+            && self.pane.is_remote()
+            && self
+                .pane
+                .current()
+                .is_some_and(|e| !e.is_dir && !e.is_package && e.kind != EntryKind::Directory)
+            && self.preview_path().is_none();
         let history = (self.pane.can_go_back(), self.pane.can_go_forward());
         let sort = self.pane.sort();
         let redraw_header = self.content_dirty || r.sort != Some(sort) || layout_changed;
@@ -3516,7 +3890,7 @@ impl AppState {
         self.reveal_cursor = false;
         self.rendered = Rendered {
             valid: true,
-            cwd: cwd.clone(),
+            folder: Some(folder.clone()),
             cursor,
             len,
             current,
@@ -3533,7 +3907,7 @@ impl AppState {
             header: self.ui.header.clone(),
             redraw_header,
             history: history_changed.then_some(history),
-            sidebar_path: dir_changed.then_some(cwd),
+            sidebar_location: dir_changed.then_some(folder),
             search_text,
             inline,
             inline_layout,
@@ -3547,6 +3921,7 @@ impl AppState {
             location_redraw: location.is_some(),
             title,
             quick_look_reload,
+            preview_fetch,
         }
     }
 }
@@ -3595,8 +3970,8 @@ impl UiPlan {
         if let Some((back, forward)) = self.history {
             self.ui.toolbar.set_navigation(back, forward);
         }
-        if let Some(path) = &self.sidebar_path {
-            sidebar::select_path(path);
+        if let Some(location) = &self.sidebar_location {
+            sidebar::select_location(location);
         }
         if let Some(text) = &self.search_text {
             if let Some(field) = self.ui.toolbar.search_field() {
@@ -3629,6 +4004,9 @@ impl UiPlan {
         }
         if self.quick_look_reload {
             if let Some(mtm) = MainThreadMarker::new() {
+                if self.preview_fetch && quicklook::is_visible(mtm) {
+                    preview_current(mtm);
+                }
                 quicklook::reload_if_visible(mtm);
             }
         }
@@ -3637,7 +4015,7 @@ impl UiPlan {
 
 /// Sets the proxy icon of the title bar, when `path` is still the directory.
 fn set_represented_url(path: &Path) {
-    let window = with_ref(|s| (s.pane.cwd() == path).then(|| s.ui.window.clone()));
+    let window = with_ref(|s| (s.pane.local_cwd() == Some(path)).then(|| s.ui.window.clone()));
     if let Some(Some(window)) = window {
         window.setRepresentedURL(NSURL::from_directory_path(path).as_deref());
     }

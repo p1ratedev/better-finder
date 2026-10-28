@@ -197,7 +197,7 @@ fn kind_of(file_type: std::fs::FileType) -> EntryKind {
     }
 }
 
-fn has_package_extension(name: &str) -> bool {
+pub(crate) fn has_package_extension(name: &str) -> bool {
     match name.rfind('.') {
         Some(index) if index > 0 => {
             let ext = &name[index + 1..];

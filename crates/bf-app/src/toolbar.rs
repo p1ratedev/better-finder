@@ -2,7 +2,8 @@
 //!
 //! Items: the sidebar tracking separator, back and forward (one group, in
 //! the navigational area), a flexible space, and the filter field
-//! (`NSSearchToolbarItem`). The window title shows `display_path(cwd)`
+//! (`NSSearchToolbarItem`). The window title shows `Location::display`
+//! (`~/x`, or `host:/path` for a remote folder)
 //! after the navigational items.
 //!
 //! The filter field costs about 25 ms to make and to lay out. The toolbar

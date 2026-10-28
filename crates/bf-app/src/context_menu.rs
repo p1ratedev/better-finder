@@ -11,6 +11,10 @@
 //! command in the model of the open menu. The command runs on the main
 //! queue after the menu closes, without a borrow of the app state.
 //!
+//! In a remote folder, the items of the local-only actions
+//! (`app::local_only`) are disabled, Open With does not show, and the list
+//! gives no entry to the Services: the entries are not local files.
+//!
 //! This module also has the AppKit parts of some actions: Open With (and
 //! its app panel), Share, and the Services of the list.
 
@@ -22,7 +26,6 @@ use std::time::Instant;
 
 use bf_core::Action;
 use bf_core::Entry;
-use bf_core::fs::display_path;
 use bf_core::names::truncate_middle;
 use bf_core::sort::SortKey;
 use block2::RcBlock;
@@ -202,6 +205,8 @@ struct Builder {
     commands: Vec<Command>,
     /// See `Model::open_with`.
     open_with: Option<PathBuf>,
+    /// The SSH destination when the list shows a remote folder.
+    host: Option<String>,
 }
 
 impl Builder {
@@ -211,6 +216,7 @@ impl Builder {
             target: target(mtm),
             commands: Vec::new(),
             open_with: None,
+            host: app::with_ref(|s| s.pane.host().map(str::to_string)).flatten(),
         }
     }
 
@@ -239,8 +245,14 @@ impl Builder {
         item
     }
 
+    /// An item for `action`. In a remote folder, a local-only action is disabled.
     fn action(&mut self, menu: &NSMenu, title: &str, action: Action) -> Retained<NSMenuItem> {
-        self.item(menu, title, Command::Action(action))
+        let disabled = self.host.is_some() && app::local_only(&action);
+        let item = self.item(menu, title, Command::Action(action));
+        if disabled {
+            item.setEnabled(false);
+        }
+        item
     }
 
     /// An item with a checkmark when `on` is true.
@@ -301,6 +313,7 @@ fn fill_open_with_now(menu: &NSMenu) {
         target: target(mtm),
         commands,
         open_with: None,
+        host: None,
     };
     fill_open_with(&mut b, menu, &path);
     MODEL.with(|m| {
@@ -351,7 +364,8 @@ fn fill_entry_menu(b: &mut Builder, menu: &NSMenu, entry: &Entry) {
     let name = quoted(&entry.name);
     let plain_folder = entry.is_dir && !entry.is_package;
     b.action(menu, "Open", Action::Open);
-    if !plain_folder {
+    // Open With needs a local file.
+    if !plain_folder && b.host.is_none() {
         // The submenu fills when it opens: `fill_open_with_now`.
         let sub = b.submenu(menu, "Open With");
         sub.setDelegate(Some(ProtocolObject::from_ref(&*b.target)));
@@ -359,7 +373,14 @@ fn fill_entry_menu(b: &mut Builder, menu: &NSMenu, entry: &Entry) {
     }
     if entry.is_package {
         let path = entry.path.to_string_lossy().into_owned();
-        b.action(menu, "Show Package Contents", Action::Goto(path));
+        let action = match &b.host {
+            Some(host) => Action::Remote(bf_core::remote::Remote {
+                destination: host.clone(),
+                path,
+            }),
+            None => Action::Goto(path),
+        };
+        b.action(menu, "Show Package Contents", action);
     }
     b.separator(menu);
     b.action(menu, "Move to Trash", Action::Trash);
@@ -464,8 +485,9 @@ fn folder_menu() -> Option<Retained<NSMenu>> {
         0 | 1 => "Paste Item".to_string(),
         n => format!("Paste {n} Items"),
     };
+    let remote = b.host.is_some();
     b.action(&menu, &title, Action::Paste)
-        .setEnabled(paste_count > 0);
+        .setEnabled(paste_count > 0 && !remote);
     b.separator(&menu);
     let sub = b.submenu(&menu, "Sort By");
     for (title, key) in [
@@ -597,13 +619,20 @@ pub fn serves(send: Option<&NSString>, give_back: Option<&NSString>) -> bool {
     }
     // SAFETY: The pasteboard types are immutable statics from AppKit.
     let known = unsafe { [NSPasteboardTypeFileURL, NSPasteboardTypeString] };
-    known.contains(&send) && app::with_ref(|s| s.pane.current().is_some()) == Some(true)
+    known.contains(&send)
+        && app::with_ref(|s| s.pane.current().is_some() && !s.pane.is_remote()) == Some(true)
 }
 
 /// Writes the entry under the cursor for a service: its file URL and its
 /// path as a string.
 pub fn write_selection(pasteboard: &NSPasteboard) -> bool {
-    let Some(Some(path)) = app::with_ref(|s| s.pane.current().map(|e| e.path.clone())) else {
+    let path = app::with_ref(|s| {
+        s.pane
+            .current()
+            .filter(|_| !s.pane.is_remote())
+            .map(|e| e.path.clone())
+    });
+    let Some(Some(path)) = path else {
         return false;
     };
     let Some(url) = NSURL::from_file_path(&path) else {
@@ -634,7 +663,7 @@ pub fn debug_print(row: Option<usize>) {
     };
     let subject = app::with_ref(|s| match row {
         Some(row) => s.pane.visible_entry(row).map(|e| e.name.clone()),
-        None => Some(display_path(s.pane.cwd())),
+        None => Some(s.pane.location().display()),
     })
     .flatten()
     .unwrap_or_default();
